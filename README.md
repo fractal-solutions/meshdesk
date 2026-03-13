@@ -2,6 +2,13 @@
 
 MeshDesk is a peer-to-peer ticketing system that runs entirely in the browser. It uses PeerJS for signaling and WebRTC data channels for sync between peers. No backend database is required.
 
+This build includes security and consistency hardening:
+- Cryptographic identities (WebCrypto keypairs) with signed events and signed snapshots.
+- Deterministic conflict resolution using Lamport clocks (no timestamp arbitrage).
+- Per-peer rate limits with soft bans to reduce spam/flooding.
+- Role enforcement and trusted-elevated allowlist for sensitive actions.
+- Snapshot versioning metadata and bounded event history (last 200 events).
+
 ## Quick Start (Local)
 
 MeshDesk is a static app. Serve the files over `http://localhost` (WebRTC is blocked on `file://` in most browsers).
@@ -28,6 +35,74 @@ Open the app and go to **Settings**:
   - Configure Host/Port/Username/Credential/TLS.
 
 Changes take effect on reconnect. Use the **Network** view and click **Reconnect PeerJS** if needed.
+
+## Identity, Trust, and Permissions (Important)
+
+### Cryptographic Identity
+Each browser generates a P-256 keypair using WebCrypto. The public key fingerprint becomes your stable identity, and your Peer ID is derived from it.
+
+- Identity is created during onboarding and stored in `localStorage`.
+- Events and snapshots are signed by the sender.
+- Peers reject events/snapshots with invalid signatures.
+
+If you clear storage, you will generate a new identity and appear as a new peer.
+
+### Trusted Elevated Allowlist
+Certain actions (escalations and supervisor overrides) are locked behind a local allowlist.
+
+Open **Settings → Trust & Role Enforcement**:
+1. Copy a trusted peer’s fingerprint from the “Known peers” list.
+2. Add it to the allowlist.
+
+Behavior:
+- Only fingerprints in this list can perform escalations and supervisor overrides.
+- “Resolve” is allowed for the assigned agent or a trusted elevated peer.
+- Customers cannot claim, escalate, or resolve.
+
+This is intentionally local policy: each browser decides who it trusts for elevated actions.
+
+## Consistency Model (How Conflicts Resolve)
+
+MeshDesk uses Lamport clocks to deterministically resolve ticket conflicts:
+- Each mutation increments a local Lamport clock.
+- Incoming events advance the local clock.
+- Ticket updates apply if `clock` is higher; ties break on `updated` timestamp and then fingerprint.
+
+Result:
+- No advantage to “racing” timestamps.
+- Peers converge on a consistent ticket state.
+
+## Sync and Snapshot Details
+
+- Events are signed and broadcast; snapshots are signed and sent on connect or request.
+- Snapshots include metadata: `snapshotVersion`, `snapshotSeq`, and `eventSeq`.
+- Event history is bounded to the most recent 200 events.
+
+If you want to force a resync:
+1. Open **Network** view.
+2. Click **Sync Now** or **Request Sync**.
+
+## Anti-Spam / Rate Limits
+
+Inbound messages are rate-limited per peer:
+- Default window: 10s
+- Default max messages: 40
+- Soft ban: 60s
+
+If a peer exceeds the limit, they are temporarily ignored. This is local policy.
+
+To adjust limits:
+- Open devtools and edit `meshdesk_settings` in `localStorage`.
+- Update `security.rateLimit`:
+  - `windowMs`
+  - `maxMessages`
+  - `banMs`
+
+## Local Storage Keys
+
+- `meshdesk_identity`: keypair, fingerprint, display name, role
+- `meshdesk_state`: tickets, events, meta (Lamport/event/snapshot counters)
+- `meshdesk_settings`: theme, network config, trust list, rate limits
 
 ## Running Your Own PeerJS Server (Signaling)
 
@@ -99,7 +174,7 @@ listening-ip=PUBLIC_IP
 
 You must allow:
 - UDP 3478
-- UDP 49152–65535
+- UDP 49152-65535
 
 Optional:
 - TCP 3478 (fallback)

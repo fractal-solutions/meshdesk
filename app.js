@@ -10,11 +10,79 @@ const timeAgo = (ts) => {
   if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
   return Math.floor(diff/86400000) + 'd ago';
 };
-const genFingerprint = () => Array.from({length:8}, () => Math.random().toString(16).substr(2,4)).join(':');
 const genAvatar = (seed) => {
   const colors = ['#6366F1','#EC4899','#10B981','#F59E0B','#3B82F6','#8B5CF6','#EF4444','#14B8A6'];
   const c = colors[Math.abs(seed.split('').reduce((a,b) => a + b.charCodeAt(0), 0)) % colors.length];
   return c;
+};
+const ROLE_RANK = { 'Customer': 0, 'L1': 1, 'L2': 2, 'Senior': 3, 'Supervisor': 4 };
+const getRoleRank = (role) => ROLE_RANK[role] ?? 0;
+const textEncoder = new TextEncoder();
+const bufferToHex = (buffer) => Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+const bufferToBase64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer)));
+const base64ToBuffer = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+const stableStringify = (value) => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+};
+const exportPublicKeyFingerprint = async (publicKey) => {
+  const spki = await crypto.subtle.exportKey('spki', publicKey);
+  const digest = await crypto.subtle.digest('SHA-256', spki);
+  const hex = bufferToHex(digest);
+  return hex.match(/.{1,4}/g)?.join(':') || hex;
+};
+const generateIdentityKeys = async () => {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+  const [publicKeyJwk, privateKeyJwk] = await Promise.all([
+    crypto.subtle.exportKey('jwk', keyPair.publicKey),
+    crypto.subtle.exportKey('jwk', keyPair.privateKey)
+  ]);
+  const fingerprint = await exportPublicKeyFingerprint(keyPair.publicKey);
+  const peerId = 'peer-' + fingerprint.replace(/:/g, '').slice(0, 12);
+  return { publicKeyJwk, privateKeyJwk, fingerprint, peerId };
+};
+const signPayload = async (privateKeyJwk, payload) => {
+  const key = await crypto.subtle.importKey(
+    'jwk',
+    privateKeyJwk,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign']
+  );
+  const data = textEncoder.encode(stableStringify(payload));
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, data);
+  return bufferToBase64(sig);
+};
+const hashPayload = async (payload) => {
+  const data = textEncoder.encode(stableStringify(payload));
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return bufferToHex(digest);
+};
+const verifyPayload = async (publicKeyJwk, payload, signature) => {
+  try {
+    const key = await crypto.subtle.importKey(
+      'jwk',
+      publicKeyJwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify']
+    );
+    const data = textEncoder.encode(stableStringify(payload));
+    return await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      base64ToBuffer(signature),
+      data
+    );
+  } catch (e) {
+    return false;
+  }
 };
 
 // ============ DATA GENERATION ============
@@ -77,7 +145,7 @@ const AGENT_RESPONSES = [
 ];
 
 function generateInitialData() {
-  return { tickets: [], events: [], meta: { version: 2 } };
+  return { tickets: [], events: [], meta: { version: 3, lamport: 0, eventSeq: 0, snapshotSeq: 0 } };
 }
 
 // ============ LOAD/SAVE ============
@@ -86,7 +154,18 @@ function loadState() {
     const saved = localStorage.getItem('meshdesk_state');
     if (saved) {
       const parsed = JSON.parse(saved);
-      if (parsed?.meta?.version === 2) return parsed;
+      if (parsed?.meta?.version === 3) return parsed;
+      if (parsed?.meta?.version === 2) {
+        const events = parsed.events || [];
+        const tickets = parsed.tickets || [];
+        const maxEventClock = events.reduce((m, e) => Math.max(m, e.clock || 0), 0);
+        const maxTicketClock = tickets.reduce((m, t) => Math.max(m, t.clock || 0), 0);
+        const maxSeq = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
+        return {
+          ...parsed,
+          meta: { version: 3, lamport: Math.max(maxEventClock, maxTicketClock), eventSeq: maxSeq, snapshotSeq: 0 }
+        };
+      }
       return null;
     }
   } catch(e) {}
@@ -95,7 +174,7 @@ function loadState() {
 
 function saveState(state) {
   try {
-    const toSave = { ...state, meta: { version: 2 } };
+    const toSave = { ...state, meta: { ...state.meta, version: 3 } };
     localStorage.setItem('meshdesk_state', JSON.stringify(toSave));
   } catch(e) {}
 }
@@ -105,6 +184,10 @@ function loadSettings() {
     theme: 'dark',
     sidebarCollapsed: false,
     demoMode: false,
+    security: {
+      trustedElevated: [],
+      rateLimit: { windowMs: 10000, maxMessages: 40, banMs: 60000 }
+    },
     peerServer: {
       useCustom: false,
       host: 'localhost',
@@ -128,6 +211,11 @@ function loadSettings() {
       return {
         ...defaults,
         ...parsed,
+        security: {
+          ...defaults.security,
+          ...(parsed.security || {}),
+          rateLimit: { ...defaults.security.rateLimit, ...(parsed.security?.rateLimit || {}) }
+        },
         peerServer: { ...defaults.peerServer, ...(parsed.peerServer || {}) },
         turn: { ...defaults.turn, ...(parsed.turn || {}) }
       };
@@ -161,9 +249,21 @@ function mergeTickets(local, incoming) {
       byId.set(t.id, t);
       continue;
     }
-    if (new Date(t.updated).getTime() > new Date(existing.updated).getTime()) {
-      byId.set(t.id, t);
+    const aClock = t.clock || 0;
+    const bClock = existing.clock || 0;
+    if (aClock !== bClock) {
+      if (aClock > bClock) byId.set(t.id, t);
+      continue;
     }
+    const aUpdated = new Date(t.updated).getTime() || 0;
+    const bUpdated = new Date(existing.updated).getTime() || 0;
+    if (aUpdated !== bUpdated) {
+      if (aUpdated > bUpdated) byId.set(t.id, t);
+      continue;
+    }
+    const aBy = t.updatedByFingerprint || t.agentId || t.customerPeerId || '';
+    const bBy = existing.updatedByFingerprint || existing.agentId || existing.customerPeerId || '';
+    if (aBy && bBy && aBy !== bBy && aBy > bBy) byId.set(t.id, t);
   }
   return Array.from(byId.values());
 }
@@ -173,7 +273,15 @@ function mergeEvents(local, incoming) {
   for (const e of incoming || []) {
     if (!byId.has(e.id)) byId.set(e.id, e);
   }
-  return Array.from(byId.values()).sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 200);
+  return Array.from(byId.values())
+    .sort((a, b) => {
+      const clockDiff = (b.clock || 0) - (a.clock || 0);
+      if (clockDiff !== 0) return clockDiff;
+      const tsDiff = new Date(b.ts).getTime() - new Date(a.ts).getTime();
+      if (tsDiff !== 0) return tsDiff;
+      return (b.id || '').localeCompare(a.id || '');
+    })
+    .slice(0, 200);
 }
 
 // ============ STATUS COLORS ============
@@ -284,12 +392,18 @@ function App() {
   const [peerId, setPeerId] = useState(identity?.peerId || null);
   const [connectTarget, setConnectTarget] = useState('');
   const [connections, setConnections] = useState([]);
+  const [knownPeers, setKnownPeers] = useState([]);
   const [peerRestartNonce, setPeerRestartNonce] = useState(0);
   const peerRef = useRef(null);
   const connsRef = useRef(new Map());
   const stateRef = useRef(state);
   const suppressBroadcastRef = useRef(false);
   const seenEventsRef = useRef(new Set());
+  const lamportRef = useRef(state.meta?.lamport || 0);
+  const eventSeqRef = useRef(state.meta?.eventSeq || 0);
+  const snapshotSeqRef = useRef(state.meta?.snapshotSeq || 0);
+  const peerRateRef = useRef(new Map());
+  const knownPeersRef = useRef(new Map());
 
   const isDark = settings.theme === 'dark';
 
@@ -301,9 +415,42 @@ function App() {
   useEffect(() => { saveSettings(settings); }, [settings]);
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => {
+    lamportRef.current = state.meta?.lamport || lamportRef.current || 0;
+    eventSeqRef.current = state.meta?.eventSeq || eventSeqRef.current || 0;
+    snapshotSeqRef.current = state.meta?.snapshotSeq || snapshotSeqRef.current || 0;
+  }, [state.meta]);
+  useEffect(() => {
     const cache = seenEventsRef.current;
     for (const e of state.events) cache.add(e.id);
   }, [state.events]);
+
+  useEffect(() => {
+    if (!identity) return;
+    if (!identity.publicKeyJwk || !identity.privateKeyJwk || !identity.publicKeyFingerprint) {
+      (async () => {
+        const keys = await generateIdentityKeys();
+        const updated = {
+          ...identity,
+          publicKeyJwk: keys.publicKeyJwk,
+          privateKeyJwk: keys.privateKeyJwk,
+          publicKeyFingerprint: keys.fingerprint,
+          peerId: identity.peerId || keys.peerId
+        };
+        setIdentity(updated);
+        saveIdentity(updated);
+        setPeerId(updated.peerId);
+      })();
+    }
+  }, [identity]);
+
+  useEffect(() => {
+    if (!identity?.publicKeyFingerprint) return;
+    setSettings(s => {
+      const trusted = s.security?.trustedElevated || [];
+      if (trusted.includes(identity.publicKeyFingerprint)) return s;
+      return { ...s, security: { ...s.security, trustedElevated: [identity.publicKeyFingerprint, ...trusted] } };
+    });
+  }, [identity?.publicKeyFingerprint]);
 
   // Simulated bot activity
   useEffect(() => {
@@ -403,10 +550,13 @@ function App() {
 
   const toggleTheme = () => setSettings(s => ({ ...s, theme: s.theme === 'dark' ? 'light' : 'dark' }));
 
-  const handleCreateIdentity = (name, role) => {
+  const handleCreateIdentity = async (name, role, keyMaterial) => {
+    const keys = keyMaterial || await generateIdentityKeys();
     const id = {
-      peerId: genId(),
-      publicKeyFingerprint: genFingerprint(),
+      peerId: keys.peerId,
+      publicKeyFingerprint: keys.fingerprint,
+      publicKeyJwk: keys.publicKeyJwk,
+      privateKeyJwk: keys.privateKeyJwk,
       displayName: name || 'Agent ' + genId().substring(0, 4),
       role: role || 'L1',
       status: 'Online',
@@ -414,6 +564,7 @@ function App() {
     };
     setIdentity(id);
     saveIdentity(id);
+    setPeerId(id.peerId);
     setShowOnboarding(false);
   };
 
@@ -421,6 +572,143 @@ function App() {
     const entry = { id: genId(), ts: new Date().toISOString(), msg, type };
     setSyncLog(prev => [entry, ...prev].slice(0, 80));
   }, []);
+
+  const bumpLamport = useCallback((remoteClock = 0) => {
+    lamportRef.current = Math.max(lamportRef.current, remoteClock || 0) + 1;
+    return lamportRef.current;
+  }, []);
+
+  const observeLamport = useCallback((remoteClock = 0) => {
+    lamportRef.current = Math.max(lamportRef.current, remoteClock || 0);
+  }, []);
+
+  const bumpEventSeq = useCallback(() => {
+    eventSeqRef.current += 1;
+    return eventSeqRef.current;
+  }, []);
+
+  const bumpSnapshotSeq = useCallback(() => {
+    snapshotSeqRef.current += 1;
+    return snapshotSeqRef.current;
+  }, []);
+
+  const syncMeta = useCallback(() => {
+    setState(prev => ({
+      ...prev,
+      meta: {
+        ...prev.meta,
+        version: 3,
+        lamport: lamportRef.current,
+        eventSeq: eventSeqRef.current,
+        snapshotSeq: snapshotSeqRef.current
+      }
+    }));
+  }, []);
+
+  const getIdentityPayload = useCallback(() => {
+    if (!identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return null;
+    return {
+      peerId: identity.peerId,
+      displayName: identity.displayName,
+      role: identity.role,
+      publicKeyFingerprint: identity.publicKeyFingerprint,
+      publicKeyJwk: identity.publicKeyJwk,
+      createdAt: identity.createdAt
+    };
+  }, [identity]);
+
+  const getEventSignPayload = useCallback((evt) => ({
+    id: evt.id,
+    type: evt.type,
+    ticketId: evt.ticketId,
+    actor: evt.actor,
+    actorRole: evt.actorRole,
+    actorPeerId: evt.actorPeerId,
+    actorFingerprint: evt.actorFingerprint,
+    actorPublicKeyJwk: evt.actorPublicKeyJwk,
+    ts: evt.ts,
+    detail: evt.detail,
+    ticketHash: evt.ticketHash,
+    clock: evt.clock,
+    seq: evt.seq
+  }), []);
+
+  const getSnapshotSignPayload = useCallback((snapshotEnvelope) => ({
+    snapshot: snapshotEnvelope.snapshot,
+    signer: snapshotEnvelope.signer
+  }), []);
+
+  const verifySignedIdentity = useCallback(async (payload, sig) => {
+    if (!payload?.publicKeyJwk || !payload?.publicKeyFingerprint || !sig) return false;
+    return await verifyPayload(payload.publicKeyJwk, payload, sig);
+  }, []);
+
+  const verifySignedEvent = useCallback(async (evt) => {
+    if (!evt?.actorPublicKeyJwk || !evt?.actorFingerprint || !evt?.sig) return false;
+    return await verifyPayload(evt.actorPublicKeyJwk, getEventSignPayload(evt), evt.sig);
+  }, [getEventSignPayload]);
+
+  const verifySignedSnapshot = useCallback(async (snapshotEnvelope) => {
+    if (!snapshotEnvelope?.signer?.publicKeyJwk || !snapshotEnvelope?.signer?.fingerprint || !snapshotEnvelope?.sig) return false;
+    return await verifyPayload(snapshotEnvelope.signer.publicKeyJwk, getSnapshotSignPayload(snapshotEnvelope), snapshotEnvelope.sig);
+  }, [getSnapshotSignPayload]);
+
+  const shouldAllowInbound = useCallback((peerIdToCheck) => {
+    const rate = settings.security?.rateLimit || { windowMs: 10000, maxMessages: 40, banMs: 60000 };
+    const now = Date.now();
+    const entry = peerRateRef.current.get(peerIdToCheck) || { count: 0, windowStart: now, bannedUntil: 0 };
+    if (entry.bannedUntil && entry.bannedUntil > now) return false;
+    if (now - entry.windowStart > rate.windowMs) {
+      entry.windowStart = now;
+      entry.count = 0;
+    }
+    entry.count += 1;
+    if (entry.count > rate.maxMessages) {
+      entry.bannedUntil = now + rate.banMs;
+      peerRateRef.current.set(peerIdToCheck, entry);
+      logSync(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning');
+      return false;
+    }
+    peerRateRef.current.set(peerIdToCheck, entry);
+    return true;
+  }, [logSync, settings.security]);
+
+  const isTrustedElevated = useCallback((fingerprint) => {
+    const trusted = settings.security?.trustedElevated || [];
+    return trusted.includes(fingerprint);
+  }, [settings.security]);
+
+  const upsertKnownPeer = useCallback((peerInfo) => {
+    if (!peerInfo?.publicKeyFingerprint) return;
+    knownPeersRef.current.set(peerInfo.publicKeyFingerprint, peerInfo);
+    setKnownPeers(prev => {
+      const existing = prev.find(p => p.publicKeyFingerprint === peerInfo.publicKeyFingerprint);
+      if (existing) {
+        return prev.map(p => p.publicKeyFingerprint === peerInfo.publicKeyFingerprint ? { ...existing, ...peerInfo } : p);
+      }
+      return [peerInfo, ...prev];
+    });
+  }, []);
+
+  const sendHello = useCallback(async (conn) => {
+    const payload = getIdentityPayload();
+    if (!payload || !identity?.privateKeyJwk) return;
+    const sig = await signPayload(identity.privateKeyJwk, payload);
+    try { conn.send({ type: 'hello', identity: payload, sig }); } catch (e) {}
+  }, [getIdentityPayload, identity?.privateKeyJwk]);
+
+  const createSignedEvent = useCallback(async (evt) => {
+    if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return null;
+    const payload = {
+      ...evt,
+      actorRole: identity.role,
+      actorPeerId: identity.peerId,
+      actorFingerprint: identity.publicKeyFingerprint,
+      actorPublicKeyJwk: identity.publicKeyJwk
+    };
+    const sig = await signPayload(identity.privateKeyJwk, getEventSignPayload(payload));
+    return { ...payload, sig };
+  }, [getEventSignPayload, identity]);
 
   const updateConnectionsState = useCallback(() => {
     const list = Array.from(connsRef.current.values()).map(conn => ({
@@ -440,64 +728,159 @@ function App() {
     });
   }, []);
 
-  const sendSnapshot = useCallback((conn) => {
+  const sendSnapshot = useCallback(async (conn) => {
+    if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
     const snapshot = {
       tickets: stateRef.current.tickets,
-      events: stateRef.current.events
+      events: stateRef.current.events.slice(0, 200),
+      meta: {
+        snapshotVersion: 1,
+        snapshotSeq: bumpSnapshotSeq(),
+        eventSeq: eventSeqRef.current
+      }
     };
+    const signer = {
+      peerId: identity.peerId,
+      fingerprint: identity.publicKeyFingerprint,
+      publicKeyJwk: identity.publicKeyJwk
+    };
+    const envelope = { type: 'snapshot', snapshot, signer };
+    const sig = await signPayload(identity.privateKeyJwk, getSnapshotSignPayload(envelope));
     try {
-      conn.send({ type: 'snapshot', snapshot });
+      conn.send({ ...envelope, sig });
       logSync(`Snapshot sent to ${conn.peer}`);
+      syncMeta();
     } catch (e) {
       logSync(`Snapshot failed to ${conn.peer}`, 'error');
     }
-  }, [logSync]);
+  }, [bumpSnapshotSeq, getSnapshotSignPayload, identity, logSync, syncMeta]);
 
   const sendSnapshotToAll = useCallback(() => {
     let sent = 0;
     connsRef.current.forEach(conn => {
       if (conn.open) {
-        sendSnapshot(conn);
+        void sendSnapshot(conn);
         sent++;
       }
     });
     if (!sent) logSync('No open connections to sync', 'warning');
-  }, [sendSnapshot]);
+  }, [logSync, sendSnapshot]);
 
   const applySnapshot = useCallback((snapshot) => {
     if (!snapshot) return;
+    const incomingEvents = snapshot.events || [];
+    const incomingTickets = snapshot.tickets || [];
+    const maxEventClock = incomingEvents.reduce((m, e) => Math.max(m, e.clock || 0), 0);
+    const maxTicketClock = incomingTickets.reduce((m, t) => Math.max(m, t.clock || 0), 0);
+    observeLamport(Math.max(maxEventClock, maxTicketClock));
+    eventSeqRef.current = Math.max(eventSeqRef.current, snapshot.meta?.eventSeq || 0);
+    snapshotSeqRef.current = Math.max(snapshotSeqRef.current, snapshot.meta?.snapshotSeq || 0);
     suppressBroadcastRef.current = true;
     setState(prev => ({
       ...prev,
-      tickets: mergeTickets(prev.tickets, snapshot.tickets),
-      events: mergeEvents(prev.events, snapshot.events)
+      tickets: mergeTickets(prev.tickets, incomingTickets),
+      events: mergeEvents(prev.events, incomingEvents),
+      meta: {
+        ...prev.meta,
+        eventSeq: Math.max(prev.meta?.eventSeq || 0, snapshot.meta?.eventSeq || 0),
+        snapshotSeq: Math.max(prev.meta?.snapshotSeq || 0, snapshot.meta?.snapshotSeq || 0),
+        lamport: Math.max(prev.meta?.lamport || 0, lamportRef.current)
+      }
     }));
     setTimeout(() => { suppressBroadcastRef.current = false; }, 0);
-  }, []);
+  }, [observeLamport]);
 
-  const applyEvent = useCallback((payload) => {
-    if (!payload?.event) return;
-    const evt = payload.event;
+  const handleIncomingSnapshot = useCallback(async (data, peerIdToCheck) => {
+    if (!data?.snapshot) return;
+    if (!shouldAllowInbound(peerIdToCheck)) return;
+    const verified = await verifySignedSnapshot(data);
+    if (!verified) {
+      logSync(`Invalid snapshot signature from ${peerIdToCheck}`, 'warning');
+      return;
+    }
+    applySnapshot(data.snapshot);
+  }, [applySnapshot, logSync, shouldAllowInbound, verifySignedSnapshot]);
+
+  const isAuthorizedEvent = useCallback((evt, ticket) => {
+    if (!evt) return false;
+    if (evt.type === 'TicketEscalated') return isTrustedElevated(evt.actorFingerprint);
+    if (evt.type === 'TicketResolved') {
+      if (ticket?.agentId && ticket.agentId === evt.actorPeerId) return true;
+      return isTrustedElevated(evt.actorFingerprint);
+    }
+    if (evt.type === 'TicketAssigned') {
+      return getRoleRank(evt.actorRole) >= getRoleRank('L1');
+    }
+    return true;
+  }, [isTrustedElevated]);
+
+  const applyEvent = useCallback((evt, ticket) => {
+    if (!evt) return;
     if (seenEventsRef.current.has(evt.id)) return;
     seenEventsRef.current.add(evt.id);
+    observeLamport(evt.clock || 0);
+    eventSeqRef.current = Math.max(eventSeqRef.current, evt.seq || 0);
     suppressBroadcastRef.current = true;
     setState(prev => {
       let tickets = prev.tickets;
-      if (payload.ticket) {
-        const existing = prev.tickets.find(t => t.id === payload.ticket.id);
+      if (ticket) {
+        const existing = prev.tickets.find(t => t.id === ticket.id);
         if (!existing) {
-          tickets = [payload.ticket, ...prev.tickets];
-        } else if (new Date(payload.ticket.updated).getTime() >= new Date(existing.updated).getTime()) {
-          tickets = prev.tickets.map(t => t.id === payload.ticket.id ? payload.ticket : t);
+          tickets = [ticket, ...prev.tickets];
+        } else {
+          const aClock = ticket.clock || 0;
+          const bClock = existing.clock || 0;
+          if (aClock > bClock || (aClock === bClock && new Date(ticket.updated).getTime() >= new Date(existing.updated).getTime())) {
+            tickets = prev.tickets.map(t => t.id === ticket.id ? ticket : t);
+          }
         }
       }
       const events = [evt, ...prev.events.filter(e => e.id !== evt.id)].slice(0, 200);
-      return { ...prev, tickets, events };
+      return {
+        ...prev,
+        tickets,
+        events,
+        meta: {
+          ...prev.meta,
+          lamport: Math.max(prev.meta?.lamport || 0, lamportRef.current),
+          eventSeq: Math.max(prev.meta?.eventSeq || 0, evt.seq || 0)
+        }
+      };
     });
     setTimeout(() => { suppressBroadcastRef.current = false; }, 0);
-  }, []);
+  }, [observeLamport]);
 
-  const emitEvent = useCallback((event, ticket) => {
+  const handleIncomingEvent = useCallback(async (payload, peerIdToCheck) => {
+    if (!payload?.event) return;
+    if (!shouldAllowInbound(peerIdToCheck)) return;
+    const evt = payload.event;
+    const verified = await verifySignedEvent(evt);
+    if (!verified) {
+      logSync(`Invalid signature from ${peerIdToCheck}`, 'warning');
+      return;
+    }
+    if (payload.ticket && evt.ticketHash) {
+      const computed = await hashPayload(payload.ticket);
+      if (computed !== evt.ticketHash) {
+        logSync(`Ticket hash mismatch from ${peerIdToCheck}`, 'warning');
+        return;
+      }
+    }
+    upsertKnownPeer({
+      peerId: evt.actorPeerId,
+      displayName: evt.actor,
+      role: evt.actorRole,
+      publicKeyFingerprint: evt.actorFingerprint,
+      publicKeyJwk: evt.actorPublicKeyJwk
+    });
+    if (!isAuthorizedEvent(evt, payload.ticket)) {
+      logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
+      return;
+    }
+    applyEvent(evt, payload.ticket);
+  }, [applyEvent, isAuthorizedEvent, logSync, shouldAllowInbound, upsertKnownPeer, verifySignedEvent]);
+
+  const emitEvent = useCallback(async (event, ticket) => {
     if (!event) return;
     seenEventsRef.current.add(event.id);
     broadcast({ type: 'event', event, ticket });
@@ -513,15 +896,27 @@ function App() {
     const handleOpen = () => {
       updateConnectionsState();
       logSync(`Connection open with ${conn.peer}`);
-      try { conn.send({ type: 'hello', from: peerId }); } catch (e) {}
-      sendSnapshot(conn);
+      void sendHello(conn);
+      void sendSnapshot(conn);
     };
     conn.on('open', handleOpen);
     conn.on('data', (data) => {
       if (!data || !data.type) return;
       if (data.type === 'hello') {
-        logSync(`Hello from ${conn.peer}`);
-        sendSnapshot(conn);
+        if (data.identity && data.sig) {
+          void (async () => {
+            const verified = await verifySignedIdentity(data.identity, data.sig);
+            if (verified) {
+              upsertKnownPeer(data.identity);
+              logSync(`Hello from ${data.identity.displayName || conn.peer}`);
+            } else {
+              logSync(`Unverified hello from ${conn.peer}`, 'warning');
+            }
+          })();
+        } else {
+          logSync(`Hello from ${conn.peer}`);
+        }
+        void sendSnapshot(conn);
       }
       if (data.type === 'ping') {
         logSync(`Ping from ${conn.peer}`);
@@ -532,16 +927,20 @@ function App() {
       }
       if (data.type === 'req_snapshot') {
         logSync(`Snapshot requested by ${conn.peer}`);
-        sendSnapshot(conn);
+        void sendSnapshot(conn);
       }
       if (data.type === 'snapshot') {
-        applySnapshot(data.snapshot);
-        logSync(`Snapshot synced with ${conn.peer}`);
+        void (async () => {
+          await handleIncomingSnapshot(data, conn.peer);
+          logSync(`Snapshot synced with ${conn.peer}`);
+        })();
         setGossipRound(prev => prev + 1);
       }
       if (data.type === 'event') {
-        applyEvent(data);
-        logSync(`Event synced with ${conn.peer}`);
+        void (async () => {
+          await handleIncomingEvent(data, conn.peer);
+          logSync(`Event synced with ${conn.peer}`);
+        })();
         setGossipRound(prev => prev + 1);
       }
     });
@@ -562,7 +961,7 @@ function App() {
       } catch (e) {}
     }
     if (conn.open) handleOpen();
-  }, [applyEvent, applySnapshot, logSync, peerId, sendSnapshot, updateConnectionsState]);
+  }, [handleIncomingEvent, handleIncomingSnapshot, logSync, sendHello, sendSnapshot, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
 
   const connectToPeer = useCallback(() => {
     if (!peerRef.current || !connectTarget.trim()) return;
@@ -706,9 +1105,11 @@ function App() {
 
   const isCustomer = identity?.role === 'Customer';
 
-  const handleCreateTicket = (ticket) => {
+  const handleCreateTicket = async (ticket) => {
     const now = new Date().toISOString();
     const customerName = isCustomer ? identity.displayName : ticket.customer;
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
     const newTicket = {
       id: genTicketId(),
       subject: ticket.subject,
@@ -724,81 +1125,156 @@ function App() {
       messages: [{ id: genId(), type: 'customer', sender: customerName, text: ticket.message, ts: now }],
       created: now,
       updated: now,
+      clock,
+      updatedByFingerprint: identity?.publicKeyFingerprint || null,
+      updatedByPeerId: identity?.peerId || null,
       replicationCount: 1,
       tags: []
     };
-    const evt = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: customerName, ts: now, detail: ticket.subject };
+    const ticketHash = await hashPayload(newTicket);
+    const evtBase = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: customerName, ts: now, detail: ticket.subject, clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
     setState(prev => ({
       ...prev,
       tickets: [newTicket, ...prev.tickets],
-      events: [evt, ...prev.events]
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
     }));
-    emitEvent(evt, newTicket);
+    await emitEvent(evt, newTicket);
     setShowCreateModal(false);
   };
 
-  const handleClaimTicket = (ticketId) => {
+  const handleClaimTicket = async (ticketId) => {
     if (!identity) return;
+    if (identity.role === 'Customer') return;
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
-    const updatedTicket = { ...base, agent: identity.displayName, status: 'In Progress', updated: now };
-    const evt = { id: genId(), type: 'TicketAssigned', ticketId, actor: identity.displayName, ts: now, detail: `Claimed by ${identity.displayName}` };
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      agent: identity.displayName,
+      agentId: identity.peerId,
+      status: 'In Progress',
+      updated: now,
+      clock,
+      updatedByFingerprint: identity.publicKeyFingerprint,
+      updatedByPeerId: identity.peerId
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'TicketAssigned', ticketId, actor: identity.displayName, ts: now, detail: `Claimed by ${identity.displayName}`, clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
     setState(prev => ({
       ...prev,
       tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
-      events: [evt, ...prev.events]
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
     }));
-    emitEvent(evt, updatedTicket);
+    await emitEvent(evt, updatedTicket);
   };
 
-  const handleEscalateTicket = (ticketId) => {
+  const handleEscalateTicket = async (ticketId) => {
+    if (!identity || !isTrustedElevated(identity.publicKeyFingerprint)) return;
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
     const currentLevelIdx = ROLES.indexOf(base.escalationLevel || 'L1');
     const nextLevel = ROLES[Math.min(currentLevelIdx + 1, ROLES.length - 1)];
-    const updatedTicket = { ...base, status: 'Escalated', escalationLevel: nextLevel, updated: now };
-    const evt = { id: genId(), type: 'TicketEscalated', ticketId, actor: identity?.displayName || 'System', ts: now, detail: `Escalated to ${nextLevel}` };
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      status: 'Escalated',
+      escalationLevel: nextLevel,
+      updated: now,
+      clock,
+      updatedByFingerprint: identity.publicKeyFingerprint,
+      updatedByPeerId: identity.peerId
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'TicketEscalated', ticketId, actor: identity?.displayName || 'System', ts: now, detail: `Escalated to ${nextLevel}`, clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
     setState(prev => {
       return {
         ...prev,
         tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
-        events: [evt, ...prev.events]
+        events: [evt, ...prev.events],
+        meta: { ...prev.meta, lamport: clock, eventSeq: seq }
       };
     });
-    emitEvent(evt, updatedTicket);
+    await emitEvent(evt, updatedTicket);
   };
 
-  const handleResolveTicket = (ticketId) => {
+  const handleResolveTicket = async (ticketId) => {
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
-    const updatedTicket = { ...base, status: 'Resolved', updated: now };
-    const evt = { id: genId(), type: 'TicketResolved', ticketId, actor: identity?.displayName || 'System', ts: now, detail: 'Ticket resolved' };
+    if (identity && base.agentId && base.agentId !== identity.peerId && !isTrustedElevated(identity.publicKeyFingerprint)) return;
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      status: 'Resolved',
+      updated: now,
+      clock,
+      updatedByFingerprint: identity?.publicKeyFingerprint || null,
+      updatedByPeerId: identity?.peerId || null
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'TicketResolved', ticketId, actor: identity?.displayName || 'System', ts: now, detail: 'Ticket resolved', clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
     setState(prev => ({
       ...prev,
       tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
-      events: [evt, ...prev.events]
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
     }));
-    emitEvent(evt, updatedTicket);
+    await emitEvent(evt, updatedTicket);
   };
 
-  const handleSendMessage = (ticketId, text) => {
+  const handleSendMessage = async (ticketId, text) => {
     if (!text.trim()) return;
     const now = new Date().toISOString();
     const isCustomerSender = identity?.role === 'Customer';
-    const msg = { id: genId(), type: isCustomerSender ? 'customer' : 'agent', sender: identity?.displayName || 'You', text, ts: now };
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const msg = {
+      id: genId(),
+      type: isCustomerSender ? 'customer' : 'agent',
+      sender: identity?.displayName || 'You',
+      text,
+      ts: now,
+      clock,
+      seq,
+      senderFingerprint: identity?.publicKeyFingerprint || null,
+      senderPeerId: identity?.peerId || null
+    };
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
-    const updatedTicket = { ...base, messages: [...base.messages, msg], updated: now };
-    const evt = { id: genId(), type: 'MessageSent', ticketId, actor: identity?.displayName || 'You', ts: now, detail: text.substring(0, 60) };
+    const updatedTicket = {
+      ...base,
+      messages: [...base.messages, msg],
+      updated: now,
+      clock,
+      updatedByFingerprint: identity?.publicKeyFingerprint || null,
+      updatedByPeerId: identity?.peerId || null
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'MessageSent', ticketId, actor: identity?.displayName || 'You', ts: now, detail: text.substring(0, 60), clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
     setState(prev => ({
       ...prev,
       tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
-      events: [evt, ...prev.events]
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
     }));
-    emitEvent(evt, updatedTicket);
+    await emitEvent(evt, updatedTicket);
   };
 
   const agentsList = useMemo(() => {
@@ -826,6 +1302,14 @@ function App() {
     return list;
   }, [connections, identity]);
 
+  const visibleTickets = useMemo(() => {
+    if (!identity) return state.tickets;
+    if (identity.role === 'Customer') {
+      return state.tickets.filter(t => t.customerPeerId === identity.peerId);
+    }
+    return state.tickets;
+  }, [identity, state.tickets]);
+
   const metrics = useMemo(() => {
     const openTickets = visibleTickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length;
     const agentsOnline = agentsList.filter(a => a.status === 'Online').length;
@@ -836,14 +1320,6 @@ function App() {
       escalationsActive: visibleTickets.filter(t => t.status === 'Escalated').length
     };
   }, [agentsList, visibleTickets]);
-
-  const visibleTickets = useMemo(() => {
-    if (!identity) return state.tickets;
-    if (identity.role === 'Customer') {
-      return state.tickets.filter(t => t.customerPeerId === identity.peerId);
-    }
-    return state.tickets;
-  }, [identity, state.tickets]);
 
   const filteredTickets = useMemo(() => {
     return visibleTickets.filter(t => {
@@ -967,7 +1443,8 @@ function App() {
             filterPriority, setFilterPriority, isDark,
             onClaim: handleClaimTicket, onEscalate: handleEscalateTicket,
             onResolve: handleResolveTicket, onSendMessage: handleSendMessage,
-            identity, setShowCreateModal
+            identity, setShowCreateModal,
+            trustedElevated: settings.security?.trustedElevated || []
           }),
           view === 'chat' && h(ChatView, { tickets: visibleTickets, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
           view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark }),
@@ -978,7 +1455,7 @@ function App() {
             onConnectPeer: connectToPeer, onDisconnectPeer: disconnectPeer, onSyncNow: sendSnapshotToAll,
             onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS
           }),
-          view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state, agents: agentsList })
+            view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
         ),
 
         // Footer
@@ -999,7 +1476,18 @@ function OnboardingModal({ onComplete, isDark }) {
   const [name, setName] = useState('');
   const [role, setRole] = useState('L1');
   const [step, setStep] = useState(0);
-  const [fingerprint] = useState(genFingerprint());
+  const [fingerprint, setFingerprint] = useState('');
+  const [keyMaterial, setKeyMaterial] = useState(null);
+  const [generating, setGenerating] = useState(false);
+
+  const handleGenerate = async () => {
+    setGenerating(true);
+    const keys = await generateIdentityKeys();
+    setKeyMaterial(keys);
+    setFingerprint(keys.fingerprint);
+    setGenerating(false);
+    setStep(1);
+  };
 
   return h('div', { className: 'h-screen w-screen flex items-center justify-center bg-slate-950 dark' },
     h('div', { className: 'w-full max-w-md p-8 animate-fade-in' },
@@ -1022,12 +1510,15 @@ function OnboardingModal({ onComplete, isDark }) {
         ),
         h('div', { className: 'p-4 rounded-lg bg-slate-800/50 border border-slate-700/50 mb-6' },
           h('div', { className: 'text-xs text-slate-500 mb-1 font-mono' }, 'Your generated fingerprint:'),
-          h('div', { className: 'font-mono text-sm text-brand-400 break-all' }, fingerprint)
+          h('div', { className: 'font-mono text-sm text-brand-400 break-all' }, fingerprint || 'Ready to generate...')
         ),
         h('button', {
-          onClick: () => setStep(1),
-          className: 'w-full py-2.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg font-medium transition-colors text-sm'
-        }, 'Generate Identity →')
+          onClick: handleGenerate,
+          disabled: generating,
+          className: generating
+            ? 'w-full py-2.5 bg-slate-700 text-slate-500 cursor-not-allowed rounded-lg font-medium transition-colors text-sm'
+            : 'w-full py-2.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg font-medium transition-colors text-sm'
+        }, generating ? 'Generating...' : 'Generate Identity →')
       ),
 
       step === 1 && h('div', { className: 'animate-fade-in' },
@@ -1052,9 +1543,9 @@ function OnboardingModal({ onComplete, isDark }) {
         )
         ),
         h('button', {
-          onClick: () => onComplete(name, role),
-          disabled: !name.trim(),
-          className: `w-full py-2.5 rounded-lg font-medium transition-colors text-sm ${name.trim() ? 'bg-brand-500 hover:bg-brand-600 text-white' : 'bg-slate-700 text-slate-500 cursor-not-allowed'}`
+          onClick: () => onComplete(name, role, keyMaterial),
+          disabled: !name.trim() || !keyMaterial,
+          className: `w-full py-2.5 rounded-lg font-medium transition-colors text-sm ${name.trim() && keyMaterial ? 'bg-brand-500 hover:bg-brand-600 text-white' : 'bg-slate-700 text-slate-500 cursor-not-allowed'}`
         }, 'Join the Network')
       )
     )
@@ -1150,7 +1641,7 @@ function DashboardView({ state, metrics, agents, isDark }) {
 }
 
 // ============ TICKETS VIEW ============
-function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onSendMessage, identity, setShowCreateModal }) {
+function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onSendMessage, identity, setShowCreateModal, trustedElevated }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
   const selectedTicket = tickets.find(t => t.id === selectedTicketId) || null;
 
@@ -1227,17 +1718,21 @@ function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQue
     // Detail panel
     selectedTicket && h(TicketDetailPanel, {
       ticket: selectedTicket, isDark, onClose: () => setSelectedTicketId(null),
-      onClaim, onEscalate, onResolve, onSendMessage, identity,
+      onClaim, onEscalate, onResolve, onSendMessage, identity, trustedElevated,
       setState: null
     })
   );
 }
 
 // ============ TICKET DETAIL PANEL ============
-function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onSendMessage, identity }) {
+function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onSendMessage, identity, trustedElevated }) {
   const [msgInput, setMsgInput] = useState('');
   const msgsEndRef = useRef(null);
   const bg = isDark ? 'bg-slate-800/80 border-slate-700/50' : 'bg-white border-slate-200';
+  const isTrusted = identity?.publicKeyFingerprint && (trustedElevated || []).includes(identity.publicKeyFingerprint);
+  const canClaim = identity?.role && identity.role !== 'Customer';
+  const canEscalate = canClaim && isTrusted && !['Escalated', 'Resolved', 'Closed'].includes(ticket.status);
+  const canResolve = canClaim && !['Resolved', 'Closed'].includes(ticket.status) && (ticket.agentId === identity?.peerId || isTrusted);
 
   useEffect(() => {
     msgsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1255,17 +1750,19 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
         h('span', { className: `px-1.5 py-0.5 text-xs rounded border ${statusColor(ticket.status)}` }, ticket.status)
       ),
       h('div', { className: 'flex items-center gap-1' },
-        identity?.role !== 'Customer' && !ticket.agent && h('button', {
+        canClaim && !ticket.agent && h('button', {
           onClick: () => onClaim(ticket.id),
           className: 'px-2.5 py-1 text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-md font-medium transition-colors'
         }, 'Claim'),
-        identity?.role !== 'Customer' && ticket.status !== 'Escalated' && ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
-          onClick: () => onEscalate(ticket.id),
-          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'bg-red-50 text-red-600 hover:bg-red-100'}`
+        canClaim && h('button', {
+          onClick: () => canEscalate && onEscalate(ticket.id),
+          disabled: !canEscalate,
+          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${canEscalate ? (isDark ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'bg-red-50 text-red-600 hover:bg-red-100') : (isDark ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-slate-100 text-slate-400 cursor-not-allowed')}`
         }, 'Escalate'),
-        identity?.role !== 'Customer' && ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
-          onClick: () => onResolve(ticket.id),
-          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100'}`
+        canClaim && h('button', {
+          onClick: () => canResolve && onResolve(ticket.id),
+          disabled: !canResolve,
+          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${canResolve ? (isDark ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100') : (isDark ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-slate-100 text-slate-400 cursor-not-allowed')}`
         }, 'Resolve'),
         h('button', {
           onClick: onClose,
@@ -1362,10 +1859,10 @@ function ChatView({ tickets, isDark, identity, onSendMessage, selectedTicketId, 
 
     // Chat window
     selectedChat ?
-      h(TicketDetailPanel, {
-        ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
-        onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onSendMessage, identity
-      }) :
+        h(TicketDetailPanel, {
+          ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
+          onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onSendMessage, identity, trustedElevated: []
+        }) :
       h('div', { className: 'flex-1 flex items-center justify-center' },
         h('div', { className: 'text-center' },
           h(Icon, { name: 'chat', size: 48, className: isDark ? 'text-slate-700 mx-auto' : 'text-slate-300 mx-auto' }),
@@ -1758,9 +2255,10 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
 }
 
 // ============ SETTINGS VIEW ============
-function SettingsView({ identity, setIdentity, settings, setSettings, isDark, state, agents }) {
+function SettingsView({ identity, setIdentity, settings, setSettings, isDark, state, agents, knownPeers }) {
   const [editName, setEditName] = useState(identity?.displayName || '');
   const [editRole, setEditRole] = useState(identity?.role || 'L1');
+  const [trustInput, setTrustInput] = useState('');
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
 
   const handleSave = () => {
@@ -1774,6 +2272,29 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
       localStorage.clear();
       window.location.reload();
     }
+  };
+
+  const addTrusted = () => {
+    const fp = trustInput.trim();
+    if (!fp) return;
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        trustedElevated: Array.from(new Set([fp, ...(s.security?.trustedElevated || [])]))
+      }
+    }));
+    setTrustInput('');
+  };
+
+  const removeTrusted = (fp) => {
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        trustedElevated: (s.security?.trustedElevated || []).filter(x => x !== fp)
+      }
+    }));
   };
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6 max-w-2xl' },
@@ -1800,6 +2321,46 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
           }, ROLES.map(r => h('option', { key: r, value: r }, r + ' Support')))
         ),
         h('button', { onClick: handleSave, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Save Changes')
+      )
+    ),
+
+    // Trust & roles
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Trust & Role Enforcement'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Only fingerprints in this list can perform elevated actions (escalations, supervisor overrides).'),
+      h('div', { className: 'flex gap-2 mb-3' },
+        h('input', {
+          type: 'text',
+          value: trustInput,
+          onChange: e => setTrustInput(e.target.value),
+          placeholder: 'fingerprint (e.g. abcd:1234:...)',
+          className: `flex-1 px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('button', { onClick: addTrusted, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Add')
+      ),
+      h('div', { className: 'space-y-2' },
+        (settings.security?.trustedElevated || []).map(fp =>
+          h('div', { key: fp, className: `flex items-center justify-between rounded-lg px-3 py-2 text-xs border ${isDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'}` },
+            h('span', { className: 'font-mono break-all' }, fp),
+            h('button', { onClick: () => removeTrusted(fp), className: 'text-red-400 hover:text-red-300 text-xs' }, 'Remove')
+          )
+        ),
+        (!settings.security?.trustedElevated || settings.security.trustedElevated.length === 0) &&
+          h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No trusted elevated peers yet.')
+      ),
+      knownPeers?.length > 0 && h('div', { className: 'mt-4' },
+        h('div', { className: `text-xs mb-2 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Known peers:'),
+        h('div', { className: 'space-y-2' },
+          knownPeers.map(p =>
+            h('div', { key: p.publicKeyFingerprint, className: `flex items-center justify-between rounded-lg px-3 py-2 text-xs border ${isDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'}` },
+              h('div', null,
+                h('div', { className: 'font-medium' }, p.displayName || p.peerId || 'Peer'),
+                h('div', { className: 'font-mono break-all' }, p.publicKeyFingerprint)
+              ),
+              h('button', { onClick: () => setTrustInput(p.publicKeyFingerprint), className: 'text-brand-400 hover:text-brand-300 text-xs' }, 'Use')
+            )
+          )
+        )
       )
     ),
 
