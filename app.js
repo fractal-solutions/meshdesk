@@ -24,6 +24,7 @@ const CATEGORIES = ['Billing', 'Technical', 'Account', 'General'];
 const PRIORITIES = ['Low', 'Medium', 'High', 'Critical'];
 const STATUSES = ['Open', 'In Progress', 'Waiting', 'Escalated', 'Resolved', 'Closed'];
 const ROLES = ['L1', 'L2', 'Senior', 'Supervisor'];
+const IDENTITY_ROLES = ['Customer', 'L1', 'L2', 'Senior', 'Supervisor'];
 const AVAIL = ['Online', 'Busy', 'Idle', 'Offline'];
 
 const TICKET_SUBJECTS = [
@@ -194,6 +195,7 @@ const availColor = (s) => ({
 }[s] || '#64748B');
 
 const roleStyle = (r) => ({
+  'Customer': 'bg-emerald-500/15 text-emerald-400',
   'L1': 'bg-blue-500/15 text-blue-400', 'L2': 'bg-purple-500/15 text-purple-400',
   'Senior': 'bg-amber-500/15 text-amber-400', 'Supervisor': 'bg-red-500/15 text-red-400'
 }[r] || 'bg-slate-500/15 text-slate-400');
@@ -702,26 +704,30 @@ function App() {
     };
   }, [identity, logSync, setupConnection, updateConnectionsState, settings?.peerServer, settings?.turn, peerRestartNonce]);
 
+  const isCustomer = identity?.role === 'Customer';
+
   const handleCreateTicket = (ticket) => {
     const now = new Date().toISOString();
+    const customerName = isCustomer ? identity.displayName : ticket.customer;
     const newTicket = {
       id: genTicketId(),
       subject: ticket.subject,
-      customer: ticket.customer,
-      customerAvatar: genAvatar(ticket.customer),
+      customer: customerName,
+      customerPeerId: isCustomer ? identity.peerId : null,
+      customerAvatar: genAvatar(customerName),
       agent: null,
       agentId: null,
       status: 'Open',
       priority: ticket.priority,
       category: ticket.category,
       escalationLevel: 'L1',
-      messages: [{ id: genId(), type: 'customer', sender: ticket.customer, text: ticket.message, ts: now }],
+      messages: [{ id: genId(), type: 'customer', sender: customerName, text: ticket.message, ts: now }],
       created: now,
       updated: now,
       replicationCount: 1,
       tags: []
     };
-    const evt = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: ticket.customer, ts: now, detail: ticket.subject };
+    const evt = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: customerName, ts: now, detail: ticket.subject };
     setState(prev => ({
       ...prev,
       tickets: [newTicket, ...prev.tickets],
@@ -781,7 +787,8 @@ function App() {
   const handleSendMessage = (ticketId, text) => {
     if (!text.trim()) return;
     const now = new Date().toISOString();
-    const msg = { id: genId(), type: 'agent', sender: identity?.displayName || 'You', text, ts: now };
+    const isCustomerSender = identity?.role === 'Customer';
+    const msg = { id: genId(), type: isCustomerSender ? 'customer' : 'agent', sender: identity?.displayName || 'You', text, ts: now };
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
     const updatedTicket = { ...base, messages: [...base.messages, msg], updated: now };
@@ -820,18 +827,26 @@ function App() {
   }, [connections, identity]);
 
   const metrics = useMemo(() => {
-    const openTickets = state.tickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length;
+    const openTickets = visibleTickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length;
     const agentsOnline = agentsList.filter(a => a.status === 'Online').length;
     return {
       openTickets,
       avgResponse: 0,
       agentsOnline,
-      escalationsActive: state.tickets.filter(t => t.status === 'Escalated').length
+      escalationsActive: visibleTickets.filter(t => t.status === 'Escalated').length
     };
-  }, [agentsList, state.tickets]);
+  }, [agentsList, visibleTickets]);
+
+  const visibleTickets = useMemo(() => {
+    if (!identity) return state.tickets;
+    if (identity.role === 'Customer') {
+      return state.tickets.filter(t => t.customerPeerId === identity.peerId);
+    }
+    return state.tickets;
+  }, [identity, state.tickets]);
 
   const filteredTickets = useMemo(() => {
-    return state.tickets.filter(t => {
+    return visibleTickets.filter(t => {
       if (filterStatus !== 'All' && t.status !== filterStatus) return false;
       if (filterPriority !== 'All' && t.priority !== filterPriority) return false;
       if (searchQuery) {
@@ -840,7 +855,7 @@ function App() {
       }
       return true;
     }).sort((a, b) => new Date(b.updated) - new Date(a.updated));
-  }, [state.tickets, filterStatus, filterPriority, searchQuery]);
+  }, [visibleTickets, filterStatus, filterPriority, searchQuery]);
 
   // Onboarding Modal
   if (showOnboarding) {
@@ -954,7 +969,7 @@ function App() {
             onResolve: handleResolveTicket, onSendMessage: handleSendMessage,
             identity, setShowCreateModal
           }),
-          view === 'chat' && h(ChatView, { state, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
+          view === 'chat' && h(ChatView, { tickets: visibleTickets, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
           view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark }),
           view === 'escalations' && h(EscalationsView, { state, isDark, onClaim: handleClaimTicket, identity }),
           view === 'network' && h(NetworkView, {
@@ -974,7 +989,7 @@ function App() {
       ),
 
       // Create ticket modal
-      showCreateModal && h(CreateTicketModal, { onClose: () => setShowCreateModal(false), onCreate: handleCreateTicket, isDark })
+      showCreateModal && h(CreateTicketModal, { onClose: () => setShowCreateModal(false), onCreate: handleCreateTicket, isDark, identity })
     )
   );
 }
@@ -1028,13 +1043,13 @@ function OnboardingModal({ onComplete, isDark }) {
           ),
           h('div', null,
             h('label', { className: 'text-sm text-slate-400 block mb-1.5' }, 'Role'),
-            h('select', {
-              value: role, onChange: e => setRole(e.target.value),
-              className: 'w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-brand-500 transition-colors'
-            },
-              ROLES.map(r => h('option', { key: r, value: r }, r + ' Support'))
-            )
+          h('select', {
+            value: role, onChange: e => setRole(e.target.value),
+            className: 'w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:border-brand-500 transition-colors'
+          },
+            IDENTITY_ROLES.map(r => h('option', { key: r, value: r }, r === 'Customer' ? 'Customer' : r + ' Support'))
           )
+        )
         ),
         h('button', {
           onClick: () => onComplete(name, role),
@@ -1240,15 +1255,15 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
         h('span', { className: `px-1.5 py-0.5 text-xs rounded border ${statusColor(ticket.status)}` }, ticket.status)
       ),
       h('div', { className: 'flex items-center gap-1' },
-        !ticket.agent && h('button', {
+        identity?.role !== 'Customer' && !ticket.agent && h('button', {
           onClick: () => onClaim(ticket.id),
           className: 'px-2.5 py-1 text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-md font-medium transition-colors'
         }, 'Claim'),
-        ticket.status !== 'Escalated' && ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
+        identity?.role !== 'Customer' && ticket.status !== 'Escalated' && ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
           onClick: () => onEscalate(ticket.id),
           className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'bg-red-50 text-red-600 hover:bg-red-100'}`
         }, 'Escalate'),
-        ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
+        identity?.role !== 'Customer' && ticket.status !== 'Resolved' && ticket.status !== 'Closed' && h('button', {
           onClick: () => onResolve(ticket.id),
           className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100'}`
         }, 'Resolve'),
@@ -1312,8 +1327,8 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
 }
 
 // ============ CHAT VIEW ============
-function ChatView({ state, isDark, identity, onSendMessage, selectedTicketId, setSelectedTicketId }) {
-  const activeChats = state.tickets.filter(t => ['In Progress', 'Open', 'Waiting', 'Escalated'].includes(t.status) && t.messages.length > 0);
+function ChatView({ tickets, isDark, identity, onSendMessage, selectedTicketId, setSelectedTicketId }) {
+  const activeChats = tickets.filter(t => ['In Progress', 'Open', 'Waiting', 'Escalated'].includes(t.status) && t.messages.length > 0);
   const selectedChat = activeChats.find(t => t.id === selectedTicketId) || activeChats[0];
 
   return h('div', { className: 'flex-1 flex overflow-hidden' },
@@ -1991,14 +2006,19 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
 }
 
 // ============ CREATE TICKET MODAL ============
-function CreateTicketModal({ onClose, onCreate, isDark }) {
+function CreateTicketModal({ onClose, onCreate, isDark, identity }) {
   const [customer, setCustomer] = useState('');
   const [subject, setSubject] = useState('');
   const [category, setCategory] = useState('Technical');
   const [priority, setPriority] = useState('Medium');
   const [message, setMessage] = useState('');
+  const isCustomer = identity?.role === 'Customer';
 
-  const canSubmit = customer.trim() && subject.trim() && message.trim();
+  useEffect(() => {
+    if (isCustomer && identity?.displayName) setCustomer(identity.displayName);
+  }, [identity, isCustomer]);
+
+  const canSubmit = (isCustomer ? true : customer.trim()) && subject.trim() && message.trim();
 
   return h('div', { className: 'fixed inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm', onClick: onClose },
     h('div', {
@@ -2013,8 +2033,11 @@ function CreateTicketModal({ onClose, onCreate, isDark }) {
         h('div', null,
           h('label', { className: `text-sm block mb-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}` }, 'Customer Name'),
           h('input', {
-            type: 'text', value: customer, onChange: e => setCustomer(e.target.value),
-            className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900 placeholder-slate-400'} focus:outline-none focus:border-brand-500`
+            type: 'text',
+            value: customer,
+            onChange: e => setCustomer(e.target.value),
+            disabled: isCustomer,
+            className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-200 text-slate-900 placeholder-slate-400'} focus:outline-none focus:border-brand-500 ${isCustomer ? 'opacity-70 cursor-not-allowed' : ''}`
           })
         ),
         h('div', null,
