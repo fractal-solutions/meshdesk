@@ -406,6 +406,13 @@ function App() {
   const knownPeersRef = useRef(new Map());
 
   const isDark = settings.theme === 'dark';
+  const knownPeersById = useMemo(() => {
+    const map = new Map();
+    (knownPeers || []).forEach(p => {
+      if (p.peerId) map.set(p.peerId, p);
+    });
+    return map;
+  }, [knownPeers]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
@@ -801,11 +808,20 @@ function App() {
     applySnapshot(data.snapshot);
   }, [applySnapshot, logSync, shouldAllowInbound, verifySignedSnapshot]);
 
-  const isAuthorizedEvent = useCallback((evt, ticket) => {
+  const isAuthorizedEvent = useCallback((evt, incomingTicket, existingTicket) => {
     if (!evt) return false;
     if (evt.type === 'TicketEscalated') return isTrustedElevated(evt.actorFingerprint);
+    if (evt.type === 'TicketClosed') {
+      if (existingTicket?.status === 'Resolved') {
+        return isTrustedElevated(evt.actorFingerprint) || (existingTicket.customerPeerId && existingTicket.customerPeerId === evt.actorPeerId);
+      }
+      return isTrustedElevated(evt.actorFingerprint);
+    }
+    if (evt.type === 'TicketReopened') {
+      return isTrustedElevated(evt.actorFingerprint) || (existingTicket?.customerPeerId && existingTicket.customerPeerId === evt.actorPeerId);
+    }
     if (evt.type === 'TicketResolved') {
-      if (ticket?.agentId && ticket.agentId === evt.actorPeerId) return true;
+      if (incomingTicket?.agentId && incomingTicket.agentId === evt.actorPeerId) return true;
       return isTrustedElevated(evt.actorFingerprint);
     }
     if (evt.type === 'TicketAssigned') {
@@ -866,6 +882,7 @@ function App() {
         return;
       }
     }
+    const existingTicket = payload.ticket ? stateRef.current.tickets.find(t => t.id === payload.ticket.id) : null;
     upsertKnownPeer({
       peerId: evt.actorPeerId,
       displayName: evt.actor,
@@ -873,7 +890,7 @@ function App() {
       publicKeyFingerprint: evt.actorFingerprint,
       publicKeyJwk: evt.actorPublicKeyJwk
     });
-    if (!isAuthorizedEvent(evt, payload.ticket)) {
+    if (!isAuthorizedEvent(evt, payload.ticket, existingTicket)) {
       logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
       return;
     }
@@ -1145,6 +1162,60 @@ function App() {
     setShowCreateModal(false);
   };
 
+  const handleStartAgentChat = async (agent) => {
+    if (!identity || identity.role === 'Customer') return;
+    if (!agent || agent.peerId === identity.peerId) return;
+    const now = new Date().toISOString();
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const subject = `Internal chat: ${identity.displayName} → ${agent.name}`;
+    const msg = {
+      id: genId(),
+      type: 'agent',
+      sender: identity.displayName,
+      text: `Started chat with ${agent.name}.`,
+      ts: now,
+      clock,
+      seq,
+      senderFingerprint: identity.publicKeyFingerprint,
+      senderPeerId: identity.peerId
+    };
+    const newTicket = {
+      id: genTicketId(),
+      subject,
+      customer: identity.displayName,
+      customerPeerId: identity.peerId,
+      customerAvatar: genAvatar(identity.displayName),
+      agent: agent.name,
+      agentId: agent.peerId,
+      status: 'In Progress',
+      priority: 'Low',
+      category: 'General',
+      escalationLevel: 'L1',
+      messages: [msg],
+      created: now,
+      updated: now,
+      clock,
+      updatedByFingerprint: identity.publicKeyFingerprint,
+      updatedByPeerId: identity.peerId,
+      replicationCount: 1,
+      tags: ['internal-chat']
+    };
+    const ticketHash = await hashPayload(newTicket);
+    const evtBase = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: identity.displayName, ts: now, detail: subject, clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
+    setState(prev => ({
+      ...prev,
+      tickets: [newTicket, ...prev.tickets],
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
+    }));
+    await emitEvent(evt, newTicket);
+    setSelectedTicketId(newTicket.id);
+    setView('chat');
+  };
+
   const handleClaimTicket = async (ticketId) => {
     if (!identity) return;
     if (identity.role === 'Customer') return;
@@ -1237,6 +1308,72 @@ function App() {
     await emitEvent(evt, updatedTicket);
   };
 
+  const handleCloseTicket = async (ticketId) => {
+    if (!identity) return;
+    const now = new Date().toISOString();
+    const base = stateRef.current.tickets.find(t => t.id === ticketId);
+    if (!base || base.status === 'Closed') return;
+    const isOwner = identity.role === 'Customer' && base.customerPeerId === identity.peerId;
+    const isElevated = isTrustedElevated(identity.publicKeyFingerprint);
+    if (base.status === 'Resolved') {
+      if (!isOwner && !isElevated) return;
+    } else {
+      if (!isElevated) return;
+    }
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      status: 'Closed',
+      updated: now,
+      clock,
+      updatedByFingerprint: identity.publicKeyFingerprint,
+      updatedByPeerId: identity.peerId
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'TicketClosed', ticketId, actor: identity.displayName, ts: now, detail: 'Ticket closed', clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
+    setState(prev => ({
+      ...prev,
+      tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
+    }));
+    await emitEvent(evt, updatedTicket);
+  };
+
+  const handleReopenTicket = async (ticketId) => {
+    if (!identity) return;
+    const now = new Date().toISOString();
+    const base = stateRef.current.tickets.find(t => t.id === ticketId);
+    if (!base || base.status !== 'Closed') return;
+    const isOwner = identity.role === 'Customer' && base.customerPeerId === identity.peerId;
+    const isElevated = isTrustedElevated(identity.publicKeyFingerprint);
+    if (!isOwner && !isElevated) return;
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      status: 'Open',
+      updated: now,
+      clock,
+      updatedByFingerprint: identity.publicKeyFingerprint,
+      updatedByPeerId: identity.peerId
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: 'TicketReopened', ticketId, actor: identity.displayName, ts: now, detail: 'Ticket reopened', clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return;
+    setState(prev => ({
+      ...prev,
+      tickets: prev.tickets.map(t => t.id === ticketId ? updatedTicket : t),
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
+    }));
+    await emitEvent(evt, updatedTicket);
+  };
+
   const handleSendMessage = async (ticketId, text) => {
     if (!text.trim()) return;
     const now = new Date().toISOString();
@@ -1290,17 +1427,21 @@ function App() {
       });
     }
     connections.forEach((c, i) => {
+      const known = knownPeersById.get(c.peerId);
+      const displayName = known?.displayName || `Peer ${i + 1}`;
+      const role = known?.role || 'L1';
       list.push({
         id: c.peerId,
-        name: 'Peer ' + (i + 1),
-        role: 'L1',
+        name: displayName,
+        role,
         status: c.open ? 'Online' : 'Offline',
-        avatar: '#3B82F6',
-        peerId: c.peerId
+        avatar: genAvatar(displayName || c.peerId),
+        peerId: c.peerId,
+        fingerprint: known?.publicKeyFingerprint || null
       });
     });
     return list;
-  }, [connections, identity]);
+  }, [connections, identity, knownPeersById]);
 
   const visibleTickets = useMemo(() => {
     if (!identity) return state.tickets;
@@ -1442,18 +1583,19 @@ function App() {
             searchQuery, setSearchQuery, filterStatus, setFilterStatus,
             filterPriority, setFilterPriority, isDark,
             onClaim: handleClaimTicket, onEscalate: handleEscalateTicket,
-            onResolve: handleResolveTicket, onSendMessage: handleSendMessage,
+            onResolve: handleResolveTicket, onCloseTicket: handleCloseTicket, onReopenTicket: handleReopenTicket, onSendMessage: handleSendMessage,
             identity, setShowCreateModal,
             trustedElevated: settings.security?.trustedElevated || []
           }),
           view === 'chat' && h(ChatView, { tickets: visibleTickets, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
-          view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark }),
+          view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark, identity, onStartChat: handleStartAgentChat }),
           view === 'escalations' && h(EscalationsView, { state, isDark, onClaim: handleClaimTicket, identity }),
           view === 'network' && h(NetworkView, {
             state, isDark, gossipRound, syncLog, identity,
             peerStatus, peerId, connections, connectTarget, setConnectTarget,
             onConnectPeer: connectToPeer, onDisconnectPeer: disconnectPeer, onSyncNow: sendSnapshotToAll,
-            onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS
+            onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS,
+            knownPeersById
           }),
             view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
         ),
@@ -1561,6 +1703,28 @@ function DashboardView({ state, metrics, agents, isDark }) {
     { label: 'Agents Online', value: metrics.agentsOnline, color: '#10B981', trend: '+1' },
     { label: 'Escalations', value: metrics.escalationsActive, color: metrics.escalationsActive > 0 ? '#EF4444' : '#10B981', trend: metrics.escalationsActive > 0 ? '+1' : '0' },
   ];
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const feedEntries = useMemo(() => {
+    const entries = [];
+    const events = state.events.slice(0, 60);
+    for (let i = 0; i < events.length; i++) {
+      const evt = events[i];
+      if (evt.type === 'MessageSent') {
+        const ticketId = evt.ticketId;
+        const messages = [evt];
+        let j = i + 1;
+        while (j < events.length && events[j].type === 'MessageSent' && events[j].ticketId === ticketId) {
+          messages.push(events[j]);
+          j++;
+        }
+        entries.push({ id: `msg:${ticketId}:${evt.ts}`, kind: 'message-group', ticketId, messages, ts: evt.ts });
+        i = j - 1;
+        continue;
+      }
+      entries.push({ id: evt.id, kind: 'event', event: evt, ts: evt.ts });
+    }
+    return entries.slice(0, 30);
+  }, [state.events]);
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6' },
     // Metric cards
@@ -1585,20 +1749,52 @@ function DashboardView({ state, metrics, agents, isDark }) {
       h('div', { className: `lg:col-span-3 rounded-xl border ${bg} overflow-hidden` },
         h('div', { className: `px-5 py-3 border-b font-medium text-sm ${isDark ? 'border-slate-700/50' : 'border-slate-200'}` }, 'Activity Feed'),
         h('div', { className: 'divide-y max-h-96 overflow-y-auto', style: { maxHeight: 420 } },
-          state.events.slice(0, 30).map((evt, i) => {
-            const evtColors = {
-              'TicketCreated': 'text-blue-400', 'TicketAssigned': 'text-indigo-400', 'TicketEscalated': 'text-red-400',
-              'TicketResolved': 'text-emerald-400', 'MessageSent': 'text-slate-400', 'AgentStatus': 'text-amber-400'
-            };
-            const dividerClass = isDark ? 'divide-slate-700/50' : 'divide-slate-100';
+          feedEntries.map((entry, i) => {
+              const evtColors = {
+                'TicketCreated': 'text-blue-400', 'TicketAssigned': 'text-indigo-400', 'TicketEscalated': 'text-red-400',
+                'TicketResolved': 'text-emerald-400', 'TicketClosed': 'text-slate-400', 'TicketReopened': 'text-amber-400',
+                'MessageSent': 'text-slate-400', 'AgentStatus': 'text-amber-400'
+              };
+            if (entry.kind === 'message-group') {
+              const isExpanded = !!expandedGroups[entry.id];
+              const count = entry.messages.length;
+              const latest = entry.messages[0];
+              return h('div', {
+                key: entry.id,
+                className: `px-5 py-3 text-sm animate-fade-in ${isDark ? 'hover:bg-slate-700/20' : 'hover:bg-slate-50'} transition-colors cursor-pointer`,
+                style: { animationDelay: i * 30 + 'ms', animationFillMode: 'both' },
+                onClick: () => setExpandedGroups(prev => ({ ...prev, [entry.id]: !prev[entry.id] }))
+              },
+                h('div', { className: 'flex items-start gap-3' },
+                  h('span', { className: 'mt-0.5 text-slate-400' }, h(Icon, { name: 'chat', size: 14 })),
+                  h('div', { className: 'flex-1 min-w-0' },
+                    h('span', { className: `font-medium ${isDark ? 'text-slate-200' : 'text-slate-700'}` }, `${count} messages`),
+                    h('span', { className: `mx-1.5 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, '·'),
+                    h('span', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, `Ticket ${entry.ticketId}`),
+                    h('div', { className: `text-xs mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, latest?.detail?.substring(0, 70))
+                  ),
+                  h('span', { className: `text-xs flex-shrink-0 font-mono ${isDark ? 'text-slate-600' : 'text-slate-400'}` }, timeAgo(entry.ts))
+                ),
+                isExpanded && h('div', { className: `mt-3 pl-7 space-y-2 text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}` },
+                  entry.messages.map(msg =>
+                    h('div', { key: msg.id, className: 'flex items-center gap-2' },
+                      h('span', { className: 'font-medium' }, msg.actor),
+                      h('span', { className: isDark ? 'text-slate-600' : 'text-slate-400' }, '·'),
+                      h('span', null, msg.detail?.substring(0, 90))
+                    )
+                  )
+                )
+              );
+            }
+            const evt = entry.event;
             return h('div', {
-              key: evt.id,
+              key: entry.id,
               className: `px-5 py-3 flex items-start gap-3 text-sm animate-fade-in ${isDark ? 'hover:bg-slate-700/20' : 'hover:bg-slate-50'} transition-colors cursor-default`,
               style: { animationDelay: i * 30 + 'ms', animationFillMode: 'both' }
             },
-              h('span', { className: `mt-0.5 ${evtColors[evt.type] || 'text-slate-400'}` },
-                h(Icon, { name: evt.type === 'TicketCreated' ? 'ticket' : evt.type === 'TicketAssigned' ? 'claim' : evt.type === 'TicketEscalated' ? 'escalation' : evt.type === 'TicketResolved' ? 'check' : evt.type === 'MessageSent' ? 'chat' : 'users', size: 14 })
-              ),
+                h('span', { className: `mt-0.5 ${evtColors[evt.type] || 'text-slate-400'}` },
+                  h(Icon, { name: evt.type === 'TicketCreated' ? 'ticket' : evt.type === 'TicketAssigned' ? 'claim' : evt.type === 'TicketEscalated' ? 'escalation' : evt.type === 'TicketResolved' ? 'check' : evt.type === 'TicketClosed' ? 'close' : evt.type === 'TicketReopened' ? 'arrow_up' : evt.type === 'MessageSent' ? 'chat' : 'users', size: 14 })
+                ),
               h('div', { className: 'flex-1 min-w-0' },
                 h('span', { className: `font-medium ${isDark ? 'text-slate-200' : 'text-slate-700'}` }, evt.actor),
                 h('span', { className: `mx-1.5 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, '·'),
@@ -1641,7 +1837,7 @@ function DashboardView({ state, metrics, agents, isDark }) {
 }
 
 // ============ TICKETS VIEW ============
-function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onSendMessage, identity, setShowCreateModal, trustedElevated }) {
+function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onCloseTicket, onReopenTicket, onSendMessage, identity, setShowCreateModal, trustedElevated }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
   const selectedTicket = tickets.find(t => t.id === selectedTicketId) || null;
 
@@ -1718,14 +1914,14 @@ function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQue
     // Detail panel
     selectedTicket && h(TicketDetailPanel, {
       ticket: selectedTicket, isDark, onClose: () => setSelectedTicketId(null),
-      onClaim, onEscalate, onResolve, onSendMessage, identity, trustedElevated,
+      onClaim, onEscalate, onResolve, onCloseTicket, onReopenTicket, onSendMessage, identity, trustedElevated,
       setState: null
     })
   );
 }
 
 // ============ TICKET DETAIL PANEL ============
-function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onSendMessage, identity, trustedElevated }) {
+function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onCloseTicket, onReopenTicket, onSendMessage, identity, trustedElevated }) {
   const [msgInput, setMsgInput] = useState('');
   const msgsEndRef = useRef(null);
   const bg = isDark ? 'bg-slate-800/80 border-slate-700/50' : 'bg-white border-slate-200';
@@ -1733,6 +1929,9 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
   const canClaim = identity?.role && identity.role !== 'Customer';
   const canEscalate = canClaim && isTrusted && !['Escalated', 'Resolved', 'Closed'].includes(ticket.status);
   const canResolve = canClaim && !['Resolved', 'Closed'].includes(ticket.status) && (ticket.agentId === identity?.peerId || isTrusted);
+  const isOwner = identity?.role === 'Customer' && ticket.customerPeerId === identity?.peerId;
+  const canClose = ticket.status !== 'Closed' && (isTrusted || (ticket.status === 'Resolved' && isOwner));
+  const canReopen = ticket.status === 'Closed' && (isTrusted || isOwner);
 
   useEffect(() => {
     msgsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1764,6 +1963,14 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
           disabled: !canResolve,
           className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${canResolve ? (isDark ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20' : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100') : (isDark ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-slate-100 text-slate-400 cursor-not-allowed')}`
         }, 'Resolve'),
+        canClose && h('button', {
+          onClick: () => onCloseTicket(ticket.id),
+          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-slate-700 text-slate-200 hover:bg-slate-600' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`
+        }, 'Close'),
+        canReopen && h('button', {
+          onClick: () => onReopenTicket(ticket.id),
+          className: `px-2.5 py-1 text-xs rounded-md font-medium transition-colors ${isDark ? 'bg-amber-500/10 text-amber-300 hover:bg-amber-500/20' : 'bg-amber-50 text-amber-600 hover:bg-amber-100'}`
+        }, 'Reopen'),
         h('button', {
           onClick: onClose,
           className: `p-1 rounded hidden lg:block ${isDark ? 'hover:bg-slate-800 text-slate-500' : 'hover:bg-slate-200 text-slate-400'}`
@@ -1784,25 +1991,28 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
 
     // Messages
     h('div', { className: 'flex-1 overflow-y-auto p-4 space-y-3' },
-      ticket.messages.map((msg, i) =>
-        h('div', {
+      ticket.messages.map((msg, i) => {
+        const isSelf = msg.senderPeerId
+          ? msg.senderPeerId === identity?.peerId
+          : (identity?.displayName && msg.sender === identity.displayName);
+        return h('div', {
           key: msg.id,
-          className: `flex ${msg.type === 'agent' ? 'justify-end' : 'justify-start'} animate-fade-in`,
+          className: `flex ${isSelf ? 'justify-end' : 'justify-start'} animate-fade-in`,
           style: { animationDelay: i * 50 + 'ms', animationFillMode: 'both' }
         },
           h('div', {
             className: `max-w-[85%] rounded-xl px-4 py-2.5 ${
-              msg.type === 'agent'
+              isSelf
                 ? 'bg-brand-500 text-white rounded-br-sm'
                 : isDark ? 'bg-slate-800 text-slate-200 rounded-bl-sm' : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
             }`
           },
-            h('div', { className: `text-xs font-medium mb-1 ${msg.type === 'agent' ? 'text-brand-200' : isDark ? 'text-slate-400' : 'text-slate-500'}` }, msg.sender),
+            h('div', { className: `text-xs font-medium mb-1 ${isSelf ? 'text-brand-200' : isDark ? 'text-slate-400' : 'text-slate-500'}` }, msg.sender),
             h('div', { className: 'text-sm leading-relaxed' }, msg.text),
-            h('div', { className: `text-xs mt-1 ${msg.type === 'agent' ? 'text-brand-300' : isDark ? 'text-slate-600' : 'text-slate-400'}` }, timeAgo(msg.ts))
+            h('div', { className: `text-xs mt-1 ${isSelf ? 'text-brand-300' : isDark ? 'text-slate-600' : 'text-slate-400'}` }, timeAgo(msg.ts))
           )
-        )
-      ),
+        );
+      }),
       h('div', { ref: msgsEndRef })
     ),
 
@@ -1859,10 +2069,10 @@ function ChatView({ tickets, isDark, identity, onSendMessage, selectedTicketId, 
 
     // Chat window
     selectedChat ?
-        h(TicketDetailPanel, {
-          ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
-          onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onSendMessage, identity, trustedElevated: []
-        }) :
+      h(TicketDetailPanel, {
+        ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
+        onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onCloseTicket: () => {}, onReopenTicket: () => {}, onSendMessage, identity, trustedElevated: []
+      }) :
       h('div', { className: 'flex-1 flex items-center justify-center' },
         h('div', { className: 'text-center' },
           h(Icon, { name: 'chat', size: 48, className: isDark ? 'text-slate-700 mx-auto' : 'text-slate-300 mx-auto' }),
@@ -1873,17 +2083,53 @@ function ChatView({ tickets, isDark, identity, onSendMessage, selectedTicketId, 
 }
 
 // ============ AGENTS VIEW ============
-function AgentsView({ agents, tickets, isDark }) {
+function AgentsView({ agents, tickets, isDark, identity, onStartChat }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('All');
+  const canChat = identity?.role && identity.role !== 'Customer';
+  const filtered = useMemo(() => {
+    return agents.filter(a => {
+      if (statusFilter !== 'All' && a.status !== statusFilter) return false;
+      if (query) {
+        const q = query.toLowerCase();
+        return a.name.toLowerCase().includes(q) || a.peerId.toLowerCase().includes(q);
+      }
+      return true;
+    });
+  }, [agents, query, statusFilter]);
+  const onlineCount = agents.filter(a => a.status === 'Online').length;
 
-  return h('div', { className: 'flex-1 overflow-y-auto p-6' },
-    agents.length === 0 ?
+  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6' },
+    h('div', { className: `rounded-xl border ${bg} p-5` },
+      h('div', { className: 'flex flex-wrap items-center justify-between gap-4' },
+        h('div', null,
+          h('div', { className: 'text-sm font-medium' }, 'Agents Directory'),
+          h('div', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}` }, `${onlineCount} online · ${agents.length} total`)
+        ),
+        h('div', { className: 'flex items-center gap-2' },
+          h('input', {
+            type: 'text',
+            value: query,
+            onChange: e => setQuery(e.target.value),
+            placeholder: 'Search name or peer id',
+            className: `px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }),
+          h('select', {
+            value: statusFilter,
+            onChange: e => setStatusFilter(e.target.value),
+            className: `px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }, ['All', ...AVAIL].map(s => h('option', { key: s, value: s }, s)))
+        )
+      )
+    ),
+    filtered.length === 0 ?
       h('div', { className: `rounded-xl border ${bg} p-8 text-center` },
         h(Icon, { name: 'users', size: 32, className: 'mx-auto text-slate-400 mb-2' }),
-        h('p', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, 'No peers connected')
+        h('p', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, 'No agents match your filters')
       ) :
       h('div', { className: 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4' },
-        agents.map((agent, i) =>
+        filtered.map((agent, i) =>
           h('div', {
             key: agent.id,
             className: `rounded-xl border p-5 ${bg} animate-fade-in`,
@@ -1892,11 +2138,11 @@ function AgentsView({ agents, tickets, isDark }) {
             h('div', { className: 'flex items-center gap-3 mb-4' },
               h('div', { className: 'relative' },
                 h('div', {
-                  className: 'w-10 h-10 rounded-xl flex items-center justify-center text-white text-sm font-bold',
+                  className: 'w-12 h-12 rounded-xl flex items-center justify-center text-white text-sm font-bold',
                   style: { backgroundColor: agent.avatar }
                 }, agent.name.split(' ').map(n => n[0]).join('')),
                 h('span', {
-                  className: 'absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2',
+                  className: 'absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2',
                   style: { backgroundColor: availColor(agent.status), borderColor: isDark ? '#1E293B' : '#fff' }
                 })
               ),
@@ -1918,7 +2164,12 @@ function AgentsView({ agents, tickets, isDark }) {
                 h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Peer ID'),
                 h('span', { className: 'font-mono text-brand-400' }, agent.peerId.substring(0, 8) + '...')
               )
-            )
+            ),
+            canChat && agent.peerId !== identity?.peerId && h('button', {
+              onClick: () => onStartChat(agent),
+              disabled: agent.status !== 'Online',
+              className: `mt-4 w-full px-3 py-2 text-xs rounded-lg font-medium transition-colors ${agent.status === 'Online' ? 'bg-brand-500 hover:bg-brand-600 text-white' : isDark ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`
+            }, 'Start Live Chat')
           )
         )
       )
@@ -2001,7 +2252,7 @@ function EscalationsView({ state, isDark, onClaim, identity }) {
 }
 
 // ============ NETWORK VIEW ============
-function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS }) {
+function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS, knownPeersById }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const nodesRef = useRef([]);
@@ -2013,18 +2264,21 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
       p.push({ id: identity.peerId, name: identity.displayName, role: identity.role, status: 'Online', tickets: 0, color: '#6366F1', isSelf: true });
     }
     connections.forEach((c, i) => {
+      const known = knownPeersById?.get(c.peerId);
+      const displayName = known?.displayName || `Peer ${i + 1}`;
+      const role = known?.role || 'L1';
       p.push({
         id: c.peerId,
-        name: 'Peer ' + (i + 1),
-        role: 'L1',
+        name: displayName,
+        role,
         status: c.open ? 'Online' : 'Offline',
         tickets: 0,
-        color: '#3B82F6',
+        color: genAvatar(displayName || c.peerId),
         isSelf: false
       });
     });
     return p;
-  }, [connections, identity]);
+  }, [connections, identity, knownPeersById]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2038,8 +2292,30 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
     canvas.style.height = hh + 'px';
     ctx.scale(2, 2);
 
+    ctx.clearRect(0, 0, w, hh);
+    const bgGrad = ctx.createRadialGradient(w * 0.5, hh * 0.5, 20, w * 0.5, hh * 0.5, Math.max(w, hh));
+    bgGrad.addColorStop(0, isDark ? 'rgba(59,130,246,0.08)' : 'rgba(59,130,246,0.04)');
+    bgGrad.addColorStop(1, isDark ? 'rgba(15,23,42,0.0)' : 'rgba(255,255,255,0.0)');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, w, hh);
+
+    // Subtle grid
+    ctx.strokeStyle = isDark ? 'rgba(148,163,184,0.05)' : 'rgba(148,163,184,0.08)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < w; x += 40) {
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, 0);
+      ctx.lineTo(x + 0.5, hh);
+      ctx.stroke();
+    }
+    for (let y = 0; y < hh; y += 40) {
+      ctx.beginPath();
+      ctx.moveTo(0, y + 0.5);
+      ctx.lineTo(w, y + 0.5);
+      ctx.stroke();
+    }
+
     if (peers.length === 0) {
-      ctx.clearRect(0, 0, w, hh);
       return;
     }
 
@@ -2062,6 +2338,16 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
     const animate = () => {
       ctx.clearRect(0, 0, w, hh);
 
+      // Orbit rings
+      ctx.beginPath();
+      ctx.arc(w / 2, hh / 2, Math.min(w, hh) * 0.22, 0, Math.PI * 2);
+      ctx.strokeStyle = isDark ? 'rgba(99,102,241,0.12)' : 'rgba(99,102,241,0.15)';
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(w / 2, hh / 2, Math.min(w, hh) * 0.33, 0, Math.PI * 2);
+      ctx.strokeStyle = isDark ? 'rgba(14,165,233,0.08)' : 'rgba(14,165,233,0.12)';
+      ctx.stroke();
+
       // Draw edges
       const nodes = nodesRef.current;
       for (let i = 0; i < peers.length; i++) {
@@ -2071,11 +2357,15 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
           const dy = nodes[j].y - nodes[i].y;
           const dist = Math.sqrt(dx*dx + dy*dy);
           if (dist < 200) {
+            const midX = (nodes[i].x + nodes[j].x) / 2;
+            const midY = (nodes[i].y + nodes[j].y) / 2;
+            const offset = Math.sin(frame * 0.01 + i + j) * 12;
             ctx.beginPath();
             ctx.moveTo(nodes[i].x, nodes[i].y);
-            ctx.lineTo(nodes[j].x, nodes[j].y);
-            ctx.strokeStyle = isDark ? `rgba(99,102,241,${0.15 * (1 - dist/200)})` : `rgba(99,102,241,${0.2 * (1 - dist/200)})`;
-            ctx.lineWidth = 1;
+            ctx.quadraticCurveTo(midX + offset, midY - offset, nodes[j].x, nodes[j].y);
+            const alpha = (1 - dist / 200) * (isDark ? 0.22 : 0.26);
+            ctx.strokeStyle = isDark ? `rgba(99,102,241,${alpha})` : `rgba(59,130,246,${alpha})`;
+            ctx.lineWidth = 1.2;
             ctx.stroke();
 
             // Animated packet
@@ -2106,6 +2396,13 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
           ctx.fill();
         }
 
+        // Outer ring
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, r + 2, 0, Math.PI * 2);
+        ctx.strokeStyle = peer.status === 'Offline' ? (isDark ? 'rgba(148,163,184,0.2)' : 'rgba(148,163,184,0.3)') : 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
         // Node circle
         ctx.beginPath();
         ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
@@ -2114,11 +2411,35 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
         ctx.fill();
         ctx.globalAlpha = 1;
 
-        // Label
+        // Status dot
+        ctx.beginPath();
+        ctx.arc(node.x + r - 2, node.y - r + 2, 3, 0, Math.PI * 2);
+        ctx.fillStyle = peer.status === 'Online' ? '#10B981' : peer.status === 'Busy' ? '#F59E0B' : peer.status === 'Idle' ? '#94A3B8' : '#64748B';
+        ctx.fill();
+
+        // Label plate
+        const label = peer.name || peer.id;
+        const role = peer.role || '';
         ctx.font = '10px IBM Plex Sans';
+        const labelW = Math.max(ctx.measureText(label).width, ctx.measureText(role).width) + 10;
+        const labelX = node.x - labelW / 2;
+        const labelY = node.y + r + 10;
+        ctx.fillStyle = isDark ? 'rgba(15,23,42,0.65)' : 'rgba(255,255,255,0.8)';
+        ctx.strokeStyle = isDark ? 'rgba(148,163,184,0.2)' : 'rgba(148,163,184,0.3)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(labelX, labelY, labelW, 22, 6);
+        } else {
+          ctx.rect(labelX, labelY, labelW, 22);
+        }
+        ctx.fill();
+        ctx.stroke();
         ctx.textAlign = 'center';
+        ctx.fillStyle = isDark ? '#E2E8F0' : '#334155';
+        ctx.fillText(label, node.x, labelY + 9);
         ctx.fillStyle = isDark ? '#94A3B8' : '#64748B';
-        ctx.fillText(peer.name.split(' ')[0], node.x, node.y + r + 14);
+        ctx.fillText(role, node.x, labelY + 18);
 
         // Gentle float
         nodes[i] = {
@@ -2190,14 +2511,20 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
       connections.length > 0 && h('div', { className: 'mt-4 text-xs' },
         h('div', { className: `mb-2 ${isDark ? 'text-slate-400' : 'text-slate-500'}` }, 'Active Connections'),
         h('div', { className: 'space-y-2' },
-          connections.map(c =>
-            h('div', {
+          connections.map((c, i) => {
+            const known = knownPeersById?.get(c.peerId);
+            const displayName = known?.displayName || `Peer ${i + 1}`;
+            const role = known?.role || 'L1';
+            return h('div', {
               key: c.peerId,
               className: `flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`
             },
               h('div', { className: 'flex items-center gap-2' },
                 h('span', { className: `w-2 h-2 rounded-full ${c.open ? 'bg-emerald-500' : 'bg-slate-500'}` }),
-                h('span', { className: 'font-mono' }, c.peerId)
+                h('div', null,
+                  h('div', { className: 'text-xs font-medium' }, displayName),
+                  h('div', { className: `text-[11px] ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, role)
+                )
               ),
               h('div', { className: 'flex items-center gap-2' },
                 h('span', { className: `text-[11px] px-2 py-0.5 rounded-full border ${c.open ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' : 'text-slate-400 border-slate-500/30 bg-slate-500/10'}` }, c.open ? 'online' : 'offline'),
@@ -2214,8 +2541,8 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
                   className: 'text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20'
                 }, 'Disconnect')
               )
-            )
-          )
+            );
+          })
         )
       )
     ),
