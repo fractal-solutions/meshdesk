@@ -76,90 +76,26 @@ const AGENT_RESPONSES = [
 ];
 
 function generateInitialData() {
-  const now = Date.now();
-  const agents = AGENT_NAMES.map((name, i) => ({
-    id: genId(),
-    name,
-    role: ROLES[i % ROLES.length],
-    status: i < 6 ? AVAIL[i % 3] : 'Offline',
-    avatar: genAvatar(name),
-    peerId: genId(),
-    fingerprint: genFingerprint(),
-    activeTickets: Math.floor(Math.random() * 5),
-    avgResponseTime: Math.floor(Math.random() * 300) + 30,
-    lastSeen: new Date(now - Math.random() * 86400000).toISOString()
-  }));
-
-  const tickets = [];
-  const events = [];
-
-  for (let i = 0; i < 18; i++) {
-    const ticketId = genTicketId();
-    const customer = CUSTOMER_NAMES[i % CUSTOMER_NAMES.length];
-    const agent = Math.random() > 0.2 ? agents[Math.floor(Math.random() * 6)] : null;
-    const status = STATUSES[Math.floor(Math.random() * STATUSES.length)];
-    const priority = PRIORITIES[Math.floor(Math.random() * PRIORITIES.length)];
-    const category = CATEGORIES[Math.floor(Math.random() * CATEGORIES.length)];
-    const created = new Date(now - Math.random() * 604800000).toISOString();
-    const escalationLevel = status === 'Escalated' ? ROLES[Math.floor(Math.random() * 3) + 1] : ROLES[0];
-
-    const msgs = [];
-    msgs.push({ id: genId(), type: 'customer', sender: customer, text: SAMPLE_MESSAGES[i % SAMPLE_MESSAGES.length], ts: created });
-    if (agent && status !== 'Open') {
-      msgs.push({ id: genId(), type: 'agent', sender: agent.name, text: AGENT_RESPONSES[i % AGENT_RESPONSES.length], ts: new Date(new Date(created).getTime() + 300000).toISOString() });
-      if (Math.random() > 0.5) {
-        msgs.push({ id: genId(), type: 'customer', sender: customer, text: SAMPLE_MESSAGES[(i+3) % SAMPLE_MESSAGES.length], ts: new Date(new Date(created).getTime() + 600000).toISOString() });
-      }
-    }
-
-    const ticket = {
-      id: ticketId,
-      subject: TICKET_SUBJECTS[i % TICKET_SUBJECTS.length],
-      customer,
-      customerAvatar: genAvatar(customer),
-      agent: agent ? agent.name : null,
-      agentId: agent ? agent.id : null,
-      status,
-      priority,
-      category,
-      escalationLevel,
-      messages: msgs,
-      created,
-      updated: new Date(new Date(created).getTime() + Math.random() * 3600000).toISOString(),
-      replicationCount: Math.floor(Math.random() * 5) + 1,
-      tags: []
-    };
-    tickets.push(ticket);
-
-    events.push({ id: genId(), type: 'TicketCreated', ticketId, actor: customer, ts: created, detail: ticket.subject });
-    if (agent) {
-      events.push({ id: genId(), type: 'TicketAssigned', ticketId, actor: agent.name, ts: new Date(new Date(created).getTime() + 60000).toISOString(), detail: `Assigned to ${agent.name}` });
-    }
-    if (status === 'Escalated') {
-      events.push({ id: genId(), type: 'TicketEscalated', ticketId, actor: agent ? agent.name : 'System', ts: new Date(new Date(created).getTime() + 120000).toISOString(), detail: `Escalated to ${escalationLevel}` });
-    }
-    if (status === 'Resolved') {
-      events.push({ id: genId(), type: 'TicketResolved', ticketId, actor: agent ? agent.name : 'System', ts: new Date(new Date(created).getTime() + 180000).toISOString(), detail: 'Ticket resolved' });
-    }
-  }
-
-  events.sort((a, b) => new Date(b.ts) - new Date(a.ts));
-
-  return { agents, tickets, events };
+  return { tickets: [], events: [], meta: { version: 2 } };
 }
 
 // ============ LOAD/SAVE ============
 function loadState() {
   try {
     const saved = localStorage.getItem('meshdesk_state');
-    if (saved) return JSON.parse(saved);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed?.meta?.version === 2) return parsed;
+      return null;
+    }
   } catch(e) {}
   return null;
 }
 
 function saveState(state) {
   try {
-    localStorage.setItem('meshdesk_state', JSON.stringify(state));
+    const toSave = { ...state, meta: { version: 2 } };
+    localStorage.setItem('meshdesk_state', JSON.stringify(toSave));
   } catch(e) {}
 }
 
@@ -332,7 +268,7 @@ function App() {
   const [showOnboarding, setShowOnboarding] = useState(!loadIdentity());
   const [view, setView] = useState('dashboard');
   const [state, setState] = useState(() => loadState() || generateInitialData());
-  const [selectedTicket, setSelectedTicket] = useState(null);
+  const [selectedTicketId, setSelectedTicketId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(!settings.sidebarCollapsed);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -456,7 +392,7 @@ function App() {
     const handler = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
       if (e.key === 'n' || e.key === 'N') { e.preventDefault(); setShowCreateModal(true); }
-      if (e.key === 'Escape') { setSelectedTicket(null); setShowCreateModal(false); }
+      if (e.key === 'Escape') { setSelectedTicketId(null); setShowCreateModal(false); }
       if (e.key === '/') { e.preventDefault(); document.getElementById('search-input')?.focus(); }
     };
     window.addEventListener('keydown', handler);
@@ -858,12 +794,41 @@ function App() {
     emitEvent(evt, updatedTicket);
   };
 
-  const metrics = useMemo(() => ({
-    openTickets: state.tickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length,
-    avgResponse: Math.floor(state.agents.reduce((a, b) => a + b.avgResponseTime, 0) / state.agents.length),
-    agentsOnline: state.agents.filter(a => a.status === 'Online').length,
-    escalationsActive: state.tickets.filter(t => t.status === 'Escalated').length
-  }), [state]);
+  const agentsList = useMemo(() => {
+    const list = [];
+    if (identity) {
+      list.push({
+        id: identity.peerId,
+        name: identity.displayName,
+        role: identity.role,
+        status: 'Online',
+        avatar: '#6366F1',
+        peerId: identity.peerId
+      });
+    }
+    connections.forEach((c, i) => {
+      list.push({
+        id: c.peerId,
+        name: 'Peer ' + (i + 1),
+        role: 'L1',
+        status: c.open ? 'Online' : 'Offline',
+        avatar: '#3B82F6',
+        peerId: c.peerId
+      });
+    });
+    return list;
+  }, [connections, identity]);
+
+  const metrics = useMemo(() => {
+    const openTickets = state.tickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length;
+    const agentsOnline = agentsList.filter(a => a.status === 'Online').length;
+    return {
+      openTickets,
+      avgResponse: 0,
+      agentsOnline,
+      escalationsActive: state.tickets.filter(t => t.status === 'Escalated').length
+    };
+  }, [agentsList, state.tickets]);
 
   const filteredTickets = useMemo(() => {
     return state.tickets.filter(t => {
@@ -922,7 +887,8 @@ function App() {
           navItems.map(item =>
             h('button', {
               key: item.id,
-              onClick: () => { setView(item.id); setSelectedTicket(null); },
+              onClick: () => { setView(item.id); setSelectedTicketId(null); },
+              
               className: `w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-all relative group ${
                 view === item.id ? 'text-white bg-white/8' : 'text-slate-400 hover:text-white hover:bg-white/5'
               }`,
@@ -979,17 +945,17 @@ function App() {
 
         // View content
         h('div', { className: 'flex-1 overflow-hidden flex' },
-          view === 'dashboard' && h(DashboardView, { state, metrics, isDark }),
+          view === 'dashboard' && h(DashboardView, { state, metrics, agents: agentsList, isDark }),
           view === 'tickets' && h(TicketsView, {
-            tickets: filteredTickets, selectedTicket, setSelectedTicket,
+            tickets: filteredTickets, selectedTicketId, setSelectedTicketId,
             searchQuery, setSearchQuery, filterStatus, setFilterStatus,
             filterPriority, setFilterPriority, isDark,
             onClaim: handleClaimTicket, onEscalate: handleEscalateTicket,
             onResolve: handleResolveTicket, onSendMessage: handleSendMessage,
             identity, setShowCreateModal
           }),
-          view === 'chat' && h(ChatView, { state, isDark, identity, onSendMessage: handleSendMessage, selectedTicket, setSelectedTicket }),
-          view === 'agents' && h(AgentsView, { agents: state.agents, isDark }),
+          view === 'chat' && h(ChatView, { state, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
+          view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark }),
           view === 'escalations' && h(EscalationsView, { state, isDark, onClaim: handleClaimTicket, identity }),
           view === 'network' && h(NetworkView, {
             state, isDark, gossipRound, syncLog, identity,
@@ -997,7 +963,7 @@ function App() {
             onConnectPeer: connectToPeer, onDisconnectPeer: disconnectPeer, onSyncNow: sendSnapshotToAll,
             onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS
           }),
-          view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state })
+          view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state, agents: agentsList })
         ),
 
         // Footer
@@ -1081,7 +1047,7 @@ function OnboardingModal({ onComplete, isDark }) {
 }
 
 // ============ DASHBOARD VIEW ============
-function DashboardView({ state, metrics, isDark }) {
+function DashboardView({ state, metrics, agents, isDark }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
   const metricCards = [
     { label: 'Open Tickets', value: metrics.openTickets, color: '#6366F1', trend: '+3' },
@@ -1141,12 +1107,12 @@ function DashboardView({ state, metrics, isDark }) {
       // Agent workload
       h('div', { className: `lg:col-span-2 rounded-xl border ${bg} overflow-hidden` },
         h('div', { className: `px-5 py-3 border-b font-medium text-sm ${isDark ? 'border-slate-700/50' : 'border-slate-200'}` }, 'Agent Workload'),
-        h('div', { className: 'p-5 space-y-3' },
-          state.agents.filter(a => a.status !== 'Offline').map(agent => {
-            const agentTickets = state.tickets.filter(t => t.agent === agent.name && !['Resolved', 'Closed'].includes(t.status));
-            const maxLoad = 8;
-            const pct = Math.min(100, (agentTickets.length / maxLoad) * 100);
-            return h('div', { key: agent.id, className: 'animate-fade-in' },
+      h('div', { className: 'p-5 space-y-3' },
+        agents.filter(a => a.status !== 'Offline').map(agent => {
+          const agentTickets = state.tickets.filter(t => t.agent === agent.name && !['Resolved', 'Closed'].includes(t.status));
+          const maxLoad = 8;
+          const pct = Math.min(100, (agentTickets.length / maxLoad) * 100);
+          return h('div', { key: agent.id, className: 'animate-fade-in' },
               h('div', { className: 'flex items-center justify-between mb-1' },
                 h('div', { className: 'flex items-center gap-2' },
                   h('span', { className: 'w-1.5 h-1.5 rounded-full', style: { backgroundColor: availColor(agent.status) } }),
@@ -1169,8 +1135,9 @@ function DashboardView({ state, metrics, isDark }) {
 }
 
 // ============ TICKETS VIEW ============
-function TicketsView({ tickets, selectedTicket, setSelectedTicket, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onSendMessage, identity, setShowCreateModal }) {
+function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQuery, setSearchQuery, filterStatus, setFilterStatus, filterPriority, setFilterPriority, isDark, onClaim, onEscalate, onResolve, onSendMessage, identity, setShowCreateModal }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
+  const selectedTicket = tickets.find(t => t.id === selectedTicketId) || null;
 
   return h('div', { className: 'flex-1 flex overflow-hidden' },
     // Ticket list
@@ -1207,7 +1174,7 @@ function TicketsView({ tickets, selectedTicket, setSelectedTicket, searchQuery, 
           tickets.map((ticket, i) =>
             h('div', {
               key: ticket.id,
-              onClick: () => setSelectedTicket(ticket),
+              onClick: () => setSelectedTicketId(ticket.id),
               className: `flex items-center gap-4 px-4 py-3 border-b cursor-pointer transition-colors animate-fade-in ${
                 selectedTicket?.id === ticket.id
                   ? isDark ? 'bg-brand-500/10 border-brand-500/20' : 'bg-brand-50 border-brand-200'
@@ -1244,7 +1211,7 @@ function TicketsView({ tickets, selectedTicket, setSelectedTicket, searchQuery, 
 
     // Detail panel
     selectedTicket && h(TicketDetailPanel, {
-      ticket: selectedTicket, isDark, onClose: () => setSelectedTicket(null),
+      ticket: selectedTicket, isDark, onClose: () => setSelectedTicketId(null),
       onClaim, onEscalate, onResolve, onSendMessage, identity,
       setState: null
     })
@@ -1345,9 +1312,9 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
 }
 
 // ============ CHAT VIEW ============
-function ChatView({ state, isDark, identity, onSendMessage, selectedTicket, setSelectedTicket }) {
+function ChatView({ state, isDark, identity, onSendMessage, selectedTicketId, setSelectedTicketId }) {
   const activeChats = state.tickets.filter(t => ['In Progress', 'Open', 'Waiting', 'Escalated'].includes(t.status) && t.messages.length > 0);
-  const selectedChat = selectedTicket || activeChats[0];
+  const selectedChat = activeChats.find(t => t.id === selectedTicketId) || activeChats[0];
 
   return h('div', { className: 'flex-1 flex overflow-hidden' },
     // Chat list
@@ -1356,7 +1323,7 @@ function ChatView({ state, isDark, identity, onSendMessage, selectedTicket, setS
       activeChats.map(t =>
         h('div', {
           key: t.id,
-          onClick: () => setSelectedTicket(t),
+          onClick: () => setSelectedTicketId(t.id),
           className: `px-4 py-3 border-b cursor-pointer transition-colors ${
             selectedChat?.id === t.id
               ? isDark ? 'bg-brand-500/10 border-brand-500/20' : 'bg-brand-50 border-brand-200'
@@ -1381,7 +1348,7 @@ function ChatView({ state, isDark, identity, onSendMessage, selectedTicket, setS
     // Chat window
     selectedChat ?
       h(TicketDetailPanel, {
-        ticket: selectedChat, isDark, onClose: () => setSelectedTicket(null),
+        ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
         onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onSendMessage, identity
       }) :
       h('div', { className: 'flex-1 flex items-center justify-center' },
@@ -1394,54 +1361,55 @@ function ChatView({ state, isDark, identity, onSendMessage, selectedTicket, setS
 }
 
 // ============ AGENTS VIEW ============
-function AgentsView({ agents, isDark }) {
+function AgentsView({ agents, tickets, isDark }) {
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6' },
-    h('div', { className: 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4' },
-      agents.map((agent, i) =>
-        h('div', {
-          key: agent.id,
-          className: `rounded-xl border p-5 ${bg} animate-fade-in`,
-          style: { animationDelay: i * 60 + 'ms', animationFillMode: 'both' }
-        },
-          h('div', { className: 'flex items-center gap-3 mb-4' },
-            h('div', { className: 'relative' },
-              h('div', {
-                className: 'w-10 h-10 rounded-xl flex items-center justify-center text-white text-sm font-bold',
-                style: { backgroundColor: agent.avatar }
-              }, agent.name.split(' ').map(n => n[0]).join('')),
-              h('span', {
-                className: 'absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2',
-                style: { backgroundColor: availColor(agent.status), borderColor: isDark ? '#1E293B' : '#fff' }
-              })
+    agents.length === 0 ?
+      h('div', { className: `rounded-xl border ${bg} p-8 text-center` },
+        h(Icon, { name: 'users', size: 32, className: 'mx-auto text-slate-400 mb-2' }),
+        h('p', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, 'No peers connected')
+      ) :
+      h('div', { className: 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4' },
+        agents.map((agent, i) =>
+          h('div', {
+            key: agent.id,
+            className: `rounded-xl border p-5 ${bg} animate-fade-in`,
+            style: { animationDelay: i * 60 + 'ms', animationFillMode: 'both' }
+          },
+            h('div', { className: 'flex items-center gap-3 mb-4' },
+              h('div', { className: 'relative' },
+                h('div', {
+                  className: 'w-10 h-10 rounded-xl flex items-center justify-center text-white text-sm font-bold',
+                  style: { backgroundColor: agent.avatar }
+                }, agent.name.split(' ').map(n => n[0]).join('')),
+                h('span', {
+                  className: 'absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2',
+                  style: { backgroundColor: availColor(agent.status), borderColor: isDark ? '#1E293B' : '#fff' }
+                })
+              ),
+              h('div', { className: 'min-w-0' },
+                h('div', { className: 'text-sm font-semibold truncate' }, agent.name),
+                h('span', { className: `text-xs px-1.5 py-0.5 rounded ${roleStyle(agent.role)}` }, agent.role)
+              )
             ),
-            h('div', { className: 'min-w-0' },
-              h('div', { className: 'text-sm font-semibold truncate' }, agent.name),
-              h('span', { className: `text-xs px-1.5 py-0.5 rounded ${roleStyle(agent.role)}` }, agent.role)
-            )
-          ),
-          h('div', { className: 'space-y-2 text-xs' },
-            h('div', { className: 'flex justify-between' },
-              h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Status'),
-              h('span', { style: { color: availColor(agent.status) } }, agent.status)
-            ),
-            h('div', { className: 'flex justify-between' },
-              h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Active Tickets'),
-              h('span', { className: 'font-mono' }, agent.activeTickets)
-            ),
-            h('div', { className: 'flex justify-between' },
-              h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Avg Response'),
-              h('span', { className: 'font-mono' }, Math.floor(agent.avgResponseTime / 60) + 'm')
-            ),
-            h('div', { className: 'flex justify-between' },
-              h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Peer ID'),
-              h('span', { className: 'font-mono text-brand-400' }, agent.peerId.substring(0, 8) + '...')
+            h('div', { className: 'space-y-2 text-xs' },
+              h('div', { className: 'flex justify-between' },
+                h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Status'),
+                h('span', { style: { color: availColor(agent.status) } }, agent.status)
+              ),
+              h('div', { className: 'flex justify-between' },
+                h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Active Tickets'),
+                h('span', { className: 'font-mono' }, tickets.filter(t => t.agent === agent.name && !['Resolved', 'Closed'].includes(t.status)).length)
+              ),
+              h('div', { className: 'flex justify-between' },
+                h('span', { className: isDark ? 'text-slate-500' : 'text-slate-400' }, 'Peer ID'),
+                h('span', { className: 'font-mono text-brand-400' }, agent.peerId.substring(0, 8) + '...')
+              )
             )
           )
         )
       )
-    )
   );
 }
 
@@ -1775,7 +1743,7 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
 }
 
 // ============ SETTINGS VIEW ============
-function SettingsView({ identity, setIdentity, settings, setSettings, isDark, state }) {
+function SettingsView({ identity, setIdentity, settings, setSettings, isDark, state, agents }) {
   const [editName, setEditName] = useState(identity?.displayName || '');
   const [editRole, setEditRole] = useState(identity?.role || 'L1');
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
@@ -2013,8 +1981,8 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
           h('span', { className: 'font-mono' }, state.tickets.length)
         ),
         h('div', { className: 'flex justify-between' },
-          h('span', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, 'Agents Known'),
-          h('span', { className: 'font-mono' }, state.agents.length)
+          h('span', { className: isDark ? 'text-slate-400' : 'text-slate-500' }, 'Peers Known'),
+          h('span', { className: 'font-mono' }, agents.length)
         )
       ),
       h('button', { onClick: handleClear, className: 'px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 text-sm rounded-lg font-medium transition-colors' }, 'Clear All Local Data')
