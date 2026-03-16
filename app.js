@@ -21,6 +21,7 @@ const textEncoder = new TextEncoder();
 const bufferToHex = (buffer) => Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 const bufferToBase64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer)));
 const base64ToBuffer = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+const EVENT_CHAIN_GENESIS = '0'.repeat(64);
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
@@ -46,6 +47,20 @@ const generateIdentityKeys = async () => {
   const fingerprint = await exportPublicKeyFingerprint(keyPair.publicKey);
   const peerId = 'peer-' + fingerprint.replace(/:/g, '').slice(0, 12);
   return { publicKeyJwk, privateKeyJwk, fingerprint, peerId };
+};
+const fingerprintFromPublicJwk = async (publicKeyJwk) => {
+  try {
+    const key = await crypto.subtle.importKey(
+      'jwk',
+      publicKeyJwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['verify']
+    );
+    return await exportPublicKeyFingerprint(key);
+  } catch (e) {
+    return null;
+  }
 };
 const signPayload = async (privateKeyJwk, payload) => {
   const key = await crypto.subtle.importKey(
@@ -83,6 +98,19 @@ const verifyPayload = async (publicKeyJwk, payload, signature) => {
   } catch (e) {
     return false;
   }
+};
+const downloadJson = (filename, payload) => {
+  try {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {}
 };
 
 // ============ DATA GENERATION ============
@@ -274,14 +302,24 @@ function mergeEvents(local, incoming) {
     if (!byId.has(e.id)) byId.set(e.id, e);
   }
   return Array.from(byId.values())
-    .sort((a, b) => {
-      const clockDiff = (b.clock || 0) - (a.clock || 0);
-      if (clockDiff !== 0) return clockDiff;
-      const tsDiff = new Date(b.ts).getTime() - new Date(a.ts).getTime();
-      if (tsDiff !== 0) return tsDiff;
-      return (b.id || '').localeCompare(a.id || '');
-    })
+    .sort(compareEventsDesc)
     .slice(0, 200);
+}
+
+function compareEventsDesc(a, b) {
+  const clockDiff = (b.clock || 0) - (a.clock || 0);
+  if (clockDiff !== 0) return clockDiff;
+  const tsDiff = new Date(b.ts).getTime() - new Date(a.ts).getTime();
+  if (tsDiff !== 0) return tsDiff;
+  return (b.id || '').localeCompare(a.id || '');
+}
+
+function compareEventsAsc(a, b) {
+  const clockDiff = (a.clock || 0) - (b.clock || 0);
+  if (clockDiff !== 0) return clockDiff;
+  const tsDiff = new Date(a.ts).getTime() - new Date(b.ts).getTime();
+  if (tsDiff !== 0) return tsDiff;
+  return (a.id || '').localeCompare(b.id || '');
 }
 
 // ============ STATUS COLORS ============
@@ -333,6 +371,7 @@ const Icon = ({ name, size = 16, className = '' }) => {
     filter: 'M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z',
     claim: 'M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11',
     key: 'M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z',
+    audit: 'M12 2l7 3v6c0 4.5-3 8.5-7 9-4-0.5-7-4.5-7-9V5l7-3z'
   };
   const d = icons[name] || icons.dashboard;
   return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', className }, h('path', { d }));
@@ -393,6 +432,7 @@ function App() {
   const [connectTarget, setConnectTarget] = useState('');
   const [connections, setConnections] = useState([]);
   const [knownPeers, setKnownPeers] = useState([]);
+  const [auditLog, setAuditLog] = useState([]);
   const [peerRestartNonce, setPeerRestartNonce] = useState(0);
   const peerRef = useRef(null);
   const connsRef = useRef(new Map());
@@ -404,6 +444,12 @@ function App() {
   const snapshotSeqRef = useRef(state.meta?.snapshotSeq || 0);
   const peerRateRef = useRef(new Map());
   const knownPeersRef = useRef(new Map());
+  const eventChainHeadRef = useRef(EVENT_CHAIN_GENESIS);
+  const identityRef = useRef(identity);
+  const peerLifecycleRef = useRef(0);
+  const setupConnectionRef = useRef(null);
+  const logSyncRef = useRef(null);
+  const updateConnectionsStateRef = useRef(null);
 
   const isDark = settings.theme === 'dark';
   const knownPeersById = useMemo(() => {
@@ -421,6 +467,7 @@ function App() {
   useEffect(() => { saveState(state); }, [state]);
   useEffect(() => { saveSettings(settings); }, [settings]);
   useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => { identityRef.current = identity; }, [identity]);
   useEffect(() => {
     lamportRef.current = state.meta?.lamport || lamportRef.current || 0;
     eventSeqRef.current = state.meta?.eventSeq || eventSeqRef.current || 0;
@@ -575,6 +622,11 @@ function App() {
     setShowOnboarding(false);
   };
 
+  const logAudit = useCallback((msg, level = 'warning', peerIdToLog = null) => {
+    const entry = { id: genId(), ts: new Date().toISOString(), msg, level, peerId: peerIdToLog };
+    setAuditLog(prev => [entry, ...prev].slice(0, 200));
+  }, []);
+
   const logSync = useCallback((msg, type = 'info') => {
     const entry = { id: genId(), ts: new Date().toISOString(), msg, type };
     setSyncLog(prev => [entry, ...prev].slice(0, 80));
@@ -640,6 +692,37 @@ function App() {
     seq: evt.seq
   }), []);
 
+  const getEventChainPayload = useCallback((evt) => ({
+    ...getEventSignPayload(evt),
+    sig: evt.sig || null
+  }), [getEventSignPayload]);
+
+  const computeEventLogHash = useCallback(async (events) => {
+    const ordered = [...(events || [])].sort(compareEventsAsc);
+    let prevHash = EVENT_CHAIN_GENESIS;
+    for (const evt of ordered) {
+      const chainPayload = { prevHash, event: getEventChainPayload(evt) };
+      const chainHash = await hashPayload(chainPayload);
+      if (evt.chainHash && evt.chainHash !== chainHash) {
+        return { ok: false, hash: null };
+      }
+      if (evt.prevHash && evt.prevHash !== prevHash) {
+        return { ok: false, hash: null };
+      }
+      prevHash = chainHash;
+    }
+    return { ok: true, hash: prevHash };
+  }, [getEventChainPayload]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const result = await computeEventLogHash(state.events);
+      if (!cancelled && result.ok) eventChainHeadRef.current = result.hash || EVENT_CHAIN_GENESIS;
+    })();
+    return () => { cancelled = true; };
+  }, [computeEventLogHash, state.events]);
+
   const getSnapshotSignPayload = useCallback((snapshotEnvelope) => ({
     snapshot: snapshotEnvelope.snapshot,
     signer: snapshotEnvelope.signer
@@ -660,6 +743,18 @@ function App() {
     return await verifyPayload(snapshotEnvelope.signer.publicKeyJwk, getSnapshotSignPayload(snapshotEnvelope), snapshotEnvelope.sig);
   }, [getSnapshotSignPayload]);
 
+  const verifySnapshotSigner = useCallback(async (snapshotEnvelope, peerIdToCheck) => {
+    const signer = snapshotEnvelope?.signer;
+    if (!signer?.publicKeyJwk || !signer?.fingerprint) return false;
+    const computedFingerprint = await fingerprintFromPublicJwk(signer.publicKeyJwk);
+    if (!computedFingerprint || computedFingerprint !== signer.fingerprint) return false;
+    if (peerIdToCheck) {
+      const known = knownPeersById.get(peerIdToCheck);
+      if (known?.publicKeyFingerprint && known.publicKeyFingerprint !== signer.fingerprint) return false;
+    }
+    return true;
+  }, [knownPeersById]);
+
   const shouldAllowInbound = useCallback((peerIdToCheck) => {
     const rate = settings.security?.rateLimit || { windowMs: 10000, maxMessages: 40, banMs: 60000 };
     const now = Date.now();
@@ -674,11 +769,12 @@ function App() {
       entry.bannedUntil = now + rate.banMs;
       peerRateRef.current.set(peerIdToCheck, entry);
       logSync(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning');
+      logAudit(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning', peerIdToCheck);
       return false;
     }
     peerRateRef.current.set(peerIdToCheck, entry);
     return true;
-  }, [logSync, settings.security]);
+  }, [logAudit, logSync, settings.security]);
 
   const isTrustedElevated = useCallback((fingerprint) => {
     const trusted = settings.security?.trustedElevated || [];
@@ -714,8 +810,12 @@ function App() {
       actorPublicKeyJwk: identity.publicKeyJwk
     };
     const sig = await signPayload(identity.privateKeyJwk, getEventSignPayload(payload));
-    return { ...payload, sig };
-  }, [getEventSignPayload, identity]);
+    const withSig = { ...payload, sig };
+    const prevHash = eventChainHeadRef.current || EVENT_CHAIN_GENESIS;
+    const chainHash = await hashPayload({ prevHash, event: getEventChainPayload(withSig) });
+    eventChainHeadRef.current = chainHash;
+    return { ...withSig, prevHash, chainHash };
+  }, [getEventChainPayload, getEventSignPayload, identity]);
 
   const updateConnectionsState = useCallback(() => {
     const list = Array.from(connsRef.current.values()).map(conn => ({
@@ -737,13 +837,22 @@ function App() {
 
   const sendSnapshot = useCallback(async (conn) => {
     if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
+    const snapshotEvents = stateRef.current.events.slice(0, 200);
+    const eventLog = await computeEventLogHash(snapshotEvents);
+    if (!eventLog.ok) {
+      logSync('Snapshot aborted: invalid event chain', 'warning');
+      return;
+    }
     const snapshot = {
       tickets: stateRef.current.tickets,
-      events: stateRef.current.events.slice(0, 200),
+      events: snapshotEvents,
       meta: {
         snapshotVersion: 1,
         snapshotSeq: bumpSnapshotSeq(),
-        eventSeq: eventSeqRef.current
+        eventSeq: eventSeqRef.current,
+        eventChainVersion: 1,
+        eventLogHash: eventLog.hash,
+        eventLogHashAlgo: 'sha256'
       }
     };
     const signer = {
@@ -760,7 +869,7 @@ function App() {
     } catch (e) {
       logSync(`Snapshot failed to ${conn.peer}`, 'error');
     }
-  }, [bumpSnapshotSeq, getSnapshotSignPayload, identity, logSync, syncMeta]);
+  }, [bumpSnapshotSeq, computeEventLogHash, getSnapshotSignPayload, identity, logSync, syncMeta]);
 
   const sendSnapshotToAll = useCallback(() => {
     let sent = 0;
@@ -803,10 +912,39 @@ function App() {
     const verified = await verifySignedSnapshot(data);
     if (!verified) {
       logSync(`Invalid snapshot signature from ${peerIdToCheck}`, 'warning');
+      logAudit(`Invalid snapshot signature`, 'warning', peerIdToCheck);
       return;
     }
+    const signerOk = await verifySnapshotSigner(data, peerIdToCheck);
+    if (!signerOk) {
+      logSync(`Snapshot signer mismatch from ${peerIdToCheck}`, 'warning');
+      logAudit(`Snapshot signer mismatch`, 'warning', peerIdToCheck);
+      return;
+    }
+    const eventLog = await computeEventLogHash(data.snapshot?.events || []);
+    if (!eventLog.ok) {
+      logSync(`Snapshot event chain invalid from ${peerIdToCheck}`, 'warning');
+      logAudit(`Snapshot event chain invalid`, 'warning', peerIdToCheck);
+      return;
+    }
+    const maxSeq = (data.snapshot?.events || []).reduce((m, e) => Math.max(m, e.seq || 0), 0);
+    if (data.snapshot?.meta?.eventSeq && maxSeq > data.snapshot.meta.eventSeq) {
+      logSync(`Snapshot event sequence invalid from ${peerIdToCheck}`, 'warning');
+      logAudit(`Snapshot event sequence invalid`, 'warning', peerIdToCheck);
+      return;
+    }
+    const declaredHash = data.snapshot?.meta?.eventLogHash;
+    if (declaredHash && declaredHash !== eventLog.hash) {
+      logSync(`Snapshot event log hash mismatch from ${peerIdToCheck}`, 'warning');
+      logAudit(`Snapshot event log hash mismatch`, 'warning', peerIdToCheck);
+      return;
+    }
+    if (!declaredHash) {
+      logSync(`Snapshot missing event log hash from ${peerIdToCheck}`, 'warning');
+      logAudit(`Snapshot missing event log hash`, 'info', peerIdToCheck);
+    }
     applySnapshot(data.snapshot);
-  }, [applySnapshot, logSync, shouldAllowInbound, verifySignedSnapshot]);
+  }, [applySnapshot, computeEventLogHash, logAudit, logSync, shouldAllowInbound, verifySignedSnapshot, verifySnapshotSigner]);
 
   const isAuthorizedEvent = useCallback((evt, incomingTicket, existingTicket) => {
     if (!evt) return false;
@@ -873,13 +1011,29 @@ function App() {
     const verified = await verifySignedEvent(evt);
     if (!verified) {
       logSync(`Invalid signature from ${peerIdToCheck}`, 'warning');
+      logAudit(`Invalid event signature`, 'warning', peerIdToCheck);
       return;
     }
     if (payload.ticket && evt.ticketHash) {
       const computed = await hashPayload(payload.ticket);
       if (computed !== evt.ticketHash) {
         logSync(`Ticket hash mismatch from ${peerIdToCheck}`, 'warning');
+        logAudit(`Ticket hash mismatch`, 'warning', peerIdToCheck);
         return;
+      }
+    }
+    if (evt.chainHash) {
+      const prevHash = evt.prevHash || EVENT_CHAIN_GENESIS;
+      const expected = await hashPayload({ prevHash, event: getEventChainPayload(evt) });
+      if (expected !== evt.chainHash) {
+        logSync(`Event chain hash invalid from ${peerIdToCheck}`, 'warning');
+        logAudit(`Event chain hash invalid`, 'warning', peerIdToCheck);
+        return;
+      }
+      const hasPrev = stateRef.current.events.some(e => e.chainHash === prevHash);
+      if (evt.prevHash && !hasPrev) {
+        logSync(`Event chain link missing from ${peerIdToCheck}`, 'warning');
+        logAudit(`Event chain link missing`, 'info', peerIdToCheck);
       }
     }
     const existingTicket = payload.ticket ? stateRef.current.tickets.find(t => t.id === payload.ticket.id) : null;
@@ -892,10 +1046,11 @@ function App() {
     });
     if (!isAuthorizedEvent(evt, payload.ticket, existingTicket)) {
       logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
+      logAudit(`Unauthorized event blocked (${evt.type})`, 'warning', peerIdToCheck);
       return;
     }
     applyEvent(evt, payload.ticket);
-  }, [applyEvent, isAuthorizedEvent, logSync, shouldAllowInbound, upsertKnownPeer, verifySignedEvent]);
+  }, [applyEvent, getEventChainPayload, isAuthorizedEvent, logAudit, logSync, shouldAllowInbound, upsertKnownPeer, verifySignedEvent]);
 
   const emitEvent = useCallback(async (event, ticket) => {
     if (!event) return;
@@ -966,8 +1121,9 @@ function App() {
       updateConnectionsState();
       logSync(`Disconnected from ${conn.peer}`, 'warning');
     });
-    conn.on('error', () => {
-      logSync(`Connection error with ${conn.peer}`, 'error');
+    conn.on('error', (err) => {
+      const detail = err?.type || err?.message || 'unknown';
+      logSync(`Connection error with ${conn.peer}: ${detail}`, 'error');
     });
     if (conn.peerConnection) {
       const pc = conn.peerConnection;
@@ -979,6 +1135,10 @@ function App() {
     }
     if (conn.open) handleOpen();
   }, [handleIncomingEvent, handleIncomingSnapshot, logSync, sendHello, sendSnapshot, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
+
+  useEffect(() => { setupConnectionRef.current = setupConnection; }, [setupConnection]);
+  useEffect(() => { logSyncRef.current = logSync; }, [logSync]);
+  useEffect(() => { updateConnectionsStateRef.current = updateConnectionsState; }, [updateConnectionsState]);
 
   const connectToPeer = useCallback(() => {
     if (!peerRef.current || !connectTarget.trim()) return;
@@ -1042,12 +1202,15 @@ function App() {
 
   // PeerJS lifecycle
   useEffect(() => {
-    if (!identity) return;
+    const activeIdentity = identityRef.current;
+    if (!activeIdentity) return;
+    peerLifecycleRef.current += 1;
+    const lifecycleId = peerLifecycleRef.current;
     if (peerRef.current) {
       try { peerRef.current.destroy(); } catch (e) {}
       peerRef.current = null;
       connsRef.current.clear();
-      updateConnectionsState();
+      updateConnectionsStateRef.current?.();
     }
     setPeerStatus('connecting');
     setNetworkStatus('syncing');
@@ -1061,7 +1224,7 @@ function App() {
     let peer;
     try {
       if (server.useCustom) {
-        peer = new Peer(identity.peerId, {
+        peer = new Peer(activeIdentity.peerId, {
           debug: 1,
           host: server.host,
           port: Number(server.port),
@@ -1070,7 +1233,7 @@ function App() {
           config: { iceServers }
         });
       } else {
-        peer = new Peer(identity.peerId, { debug: 1, config: { iceServers } });
+        peer = new Peer(activeIdentity.peerId, { debug: 1, config: { iceServers } });
       }
     } catch (e) {
       setPeerStatus('error');
@@ -1078,47 +1241,53 @@ function App() {
       return;
     }
     peerRef.current = peer;
+    logSyncRef.current?.(`PeerJS init #${lifecycleId} (peerId=${activeIdentity.peerId})`);
 
     peer.on('open', (id) => {
       setPeerStatus('online');
       setPeerId(id);
-      if (identity.peerId !== id) {
-        const updated = { ...identity, peerId: id };
+      const latest = identityRef.current || activeIdentity;
+      if (latest?.peerId !== id) {
+        const updated = { ...latest, peerId: id };
         setIdentity(updated);
         saveIdentity(updated);
       }
-      updateConnectionsState();
-      logSync(`Peer ready: ${id}`);
+      updateConnectionsStateRef.current?.();
+      logSyncRef.current?.(`Peer ready: ${id}`);
     });
     peer.on('connection', (conn) => {
-      setupConnection(conn);
+      setupConnectionRef.current?.(conn);
     });
     peer.on('disconnected', () => {
       setPeerStatus('offline');
       setNetworkStatus('idle');
+      logSyncRef.current?.(`PeerJS disconnected #${lifecycleId}`, 'warning');
     });
     peer.on('close', () => {
       setPeerStatus('offline');
       setNetworkStatus('idle');
+      logSyncRef.current?.(`PeerJS closed #${lifecycleId}`, 'warning');
     });
     peer.on('error', (err) => {
       setPeerStatus('error');
-      logSync(`Peer error: ${err?.type || 'unknown'}`, 'error');
+      logSyncRef.current?.(`Peer error: ${err?.type || 'unknown'} ${err?.message || ''}`.trim(), 'error');
       if (err?.type === 'unavailable-id') {
         const newId = genId();
-        const updated = { ...identity, peerId: newId };
+        const latest = identityRef.current || activeIdentity;
+        const updated = { ...latest, peerId: newId };
         setIdentity(updated);
         saveIdentity(updated);
       }
     });
 
     return () => {
+      logSyncRef.current?.(`PeerJS cleanup #${lifecycleId}`, 'warning');
       try { peer.destroy(); } catch (e) {}
       peerRef.current = null;
       connsRef.current.clear();
-      updateConnectionsState();
+      updateConnectionsStateRef.current?.();
     };
-  }, [identity, logSync, setupConnection, updateConnectionsState, settings?.peerServer, settings?.turn, peerRestartNonce]);
+  }, [identity?.peerId, settings?.peerServer, settings?.turn, peerRestartNonce]);
 
   const isCustomer = identity?.role === 'Customer';
 
@@ -1474,6 +1643,8 @@ function App() {
     }).sort((a, b) => new Date(b.updated) - new Date(a.updated));
   }, [visibleTickets, filterStatus, filterPriority, searchQuery]);
 
+  const auditAlerts = useMemo(() => auditLog.filter(e => e.level !== 'info').length, [auditLog]);
+
   // Onboarding Modal
   if (showOnboarding) {
     return h(ToastProvider, null, h(OnboardingModal, { onComplete: handleCreateIdentity, isDark }));
@@ -1486,6 +1657,7 @@ function App() {
     { id: 'agents', icon: 'users', label: 'Agents' },
     { id: 'escalations', icon: 'escalation', label: 'Escalations', badge: metrics.escalationsActive, badgeColor: 'red' },
     { id: 'network', icon: 'network', label: 'Network' },
+    { id: 'audit', icon: 'audit', label: 'Audit', badge: auditAlerts, badgeColor: 'red' },
     { id: 'settings', icon: 'settings', label: 'Settings' },
   ];
 
@@ -1597,7 +1769,8 @@ function App() {
             onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS,
             knownPeersById
           }),
-            view === 'settings' && h(SettingsView, { identity, setIdentity, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
+          view === 'audit' && h(AuditView, { auditLog, isDark }),
+            view === 'settings' && h(SettingsView, { identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
         ),
 
         // Footer
@@ -2581,11 +2754,51 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
   );
 }
 
+// ============ AUDIT VIEW ============
+function AuditView({ auditLog, isDark }) {
+  const levelStyle = (level) => {
+    if (level === 'error') return isDark ? 'text-red-400' : 'text-red-600';
+    if (level === 'warning') return isDark ? 'text-amber-400' : 'text-amber-600';
+    return isDark ? 'text-slate-400' : 'text-slate-500';
+  };
+
+  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-4 max-w-4xl' },
+    h('div', { className: 'flex items-center justify-between' },
+      h('div', null,
+        h('div', { className: 'text-lg font-semibold' }, 'Audit Log'),
+        h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Signature failures, snapshot mismatches, rate-limit actions, and other security-related events.')
+      ),
+      h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, `${auditLog.length} entries`)
+    ),
+    auditLog.length === 0 && h('div', { className: `text-sm ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No audit events yet.'),
+    auditLog.length > 0 && h('div', { className: `rounded-xl border ${isDark ? 'border-slate-800 bg-slate-900/40' : 'border-slate-200 bg-white'}` },
+      h('div', { className: `grid grid-cols-12 gap-2 px-4 py-2 text-xs uppercase tracking-wide ${isDark ? 'text-slate-500 border-b border-slate-800' : 'text-slate-400 border-b border-slate-200'}` },
+        h('div', { className: 'col-span-2' }, 'Time'),
+        h('div', { className: 'col-span-2' }, 'Level'),
+        h('div', { className: 'col-span-3' }, 'Peer'),
+        h('div', { className: 'col-span-5' }, 'Message')
+      ),
+      h('div', { className: 'divide-y ' + (isDark ? 'divide-slate-800' : 'divide-slate-100') },
+        auditLog.map(entry =>
+          h('div', { key: entry.id, className: 'grid grid-cols-12 gap-2 px-4 py-2 text-xs items-start' },
+            h('div', { className: `col-span-2 ${isDark ? 'text-slate-400' : 'text-slate-500'}` }, new Date(entry.ts).toLocaleTimeString()),
+            h('div', { className: `col-span-2 font-medium ${levelStyle(entry.level)}` }, entry.level || 'info'),
+            h('div', { className: `col-span-3 font-mono break-all ${isDark ? 'text-slate-300' : 'text-slate-700'}` }, entry.peerId || '—'),
+            h('div', { className: `col-span-5 ${isDark ? 'text-slate-200' : 'text-slate-700'}` }, entry.msg)
+          )
+        )
+      )
+    )
+  );
+}
+
 // ============ SETTINGS VIEW ============
-function SettingsView({ identity, setIdentity, settings, setSettings, isDark, state, agents, knownPeers }) {
+function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents, knownPeers }) {
   const [editName, setEditName] = useState(identity?.displayName || '');
   const [editRole, setEditRole] = useState(identity?.role || 'L1');
   const [trustInput, setTrustInput] = useState('');
+  const [importText, setImportText] = useState('');
+  const [importStatus, setImportStatus] = useState(null);
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
 
   const handleSave = () => {
@@ -2624,6 +2837,44 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
     }));
   };
 
+  const handleExportIdentity = async () => {
+    if (!identity?.publicKeyJwk || !identity?.privateKeyJwk) return;
+    const bundle = {
+      ...identity,
+      bundleVersion: 1,
+      exportedAt: new Date().toISOString()
+    };
+    downloadJson(`meshdesk-identity-${identity.peerId || 'bundle'}.json`, bundle);
+    if (navigator?.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(JSON.stringify(bundle, null, 2)); } catch (e) {}
+    }
+    setImportStatus({ type: 'info', msg: 'Identity bundle exported. Keep it private.' });
+  };
+
+  const handleImportIdentity = async () => {
+    try {
+      const parsed = JSON.parse(importText || '');
+      if (!parsed?.publicKeyJwk || !parsed?.privateKeyJwk) throw new Error('missing');
+      const computed = await fingerprintFromPublicJwk(parsed.publicKeyJwk);
+      if (!computed) throw new Error('fingerprint');
+      if (parsed.publicKeyFingerprint && parsed.publicKeyFingerprint !== computed) throw new Error('mismatch');
+      const peerId = parsed.peerId || ('peer-' + computed.replace(/:/g, '').slice(0, 12));
+      const updated = {
+        ...parsed,
+        publicKeyFingerprint: computed,
+        peerId,
+        displayName: parsed.displayName || editName || 'Anonymous',
+        role: parsed.role || editRole || 'L1'
+      };
+      setIdentity(updated);
+      saveIdentity(updated);
+      setPeerId(updated.peerId);
+      setImportStatus({ type: 'success', msg: 'Identity imported successfully.' });
+    } catch (e) {
+      setImportStatus({ type: 'error', msg: 'Invalid identity bundle.' });
+    }
+  };
+
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6 max-w-2xl' },
     // Identity
     h('div', { className: `rounded-xl border ${bg} p-6` },
@@ -2649,6 +2900,28 @@ function SettingsView({ identity, setIdentity, settings, setSettings, isDark, st
         ),
         h('button', { onClick: handleSave, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Save Changes')
       )
+    ),
+
+    // Identity backup
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Identity Backup & Recovery'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Export a private identity bundle and store it somewhere safe. Anyone with this file can impersonate you.'),
+      h('div', { className: 'flex flex-wrap gap-2 mb-4' },
+        h('button', { onClick: handleExportIdentity, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Export Identity'),
+        h('button', { onClick: () => setImportText(''), className: `px-4 py-2 text-sm rounded-lg font-medium border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Clear Import')
+      ),
+      h('div', { className: 'space-y-2' },
+        h('label', { className: 'text-sm text-slate-400 block' }, 'Import Identity Bundle'),
+        h('textarea', {
+          rows: 5,
+          value: importText,
+          onChange: e => setImportText(e.target.value),
+          placeholder: 'Paste identity JSON here',
+          className: `w-full px-3 py-2 text-xs rounded-lg border font-mono ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('button', { onClick: handleImportIdentity, className: 'px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Import Identity')
+      ),
+      importStatus && h('div', { className: `mt-3 text-xs ${importStatus.type === 'error' ? 'text-red-400' : importStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, importStatus.msg)
     ),
 
     // Trust & roles

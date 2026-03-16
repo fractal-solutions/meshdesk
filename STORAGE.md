@@ -1,59 +1,134 @@
-# Storage Design - MeshDesk (Real P2P)
+# Storage Design - MeshDesk (P2P)
 
-## Data Requirements
+## localStorage Keys
 
-- **localStorage**: User identity, theme preferences, sidebar state, active view, all ticket/event data
-- **PeerJS**: Real-time state sync between connected browsers
-- **No backend needed**: Fully client-side P2P via PeerJS signaling server
+- `meshdesk_identity`
+  - Cryptographic identity bundle used for signing events/snapshots.
+  - Fields:
+    - `peerId`
+    - `displayName`
+    - `role`
+    - `status`
+    - `createdAt`
+    - `publicKeyJwk`
+    - `privateKeyJwk`
+    - `publicKeyFingerprint`
 
-## Storage Strategy
+- `meshdesk_state`
+  - Full app state + bounded event history.
+  - Fields:
+    - `agents`: array
+    - `tickets`: array
+    - `events`: array (bounded, newest-first, max 200)
+    - `meta`:
+      - `version`: `3`
+      - `lamport`
+      - `eventSeq`
+      - `snapshotSeq`
 
-### Offline-First (localStorage)
-- All data persisted locally
-- On peer connect, full state merge occurs
-- Events are broadcast incrementally
+- `meshdesk_settings`
+  - UI + security + networking preferences.
+  - Fields:
+    - `theme`
+    - `sidebarCollapsed`
+    - `demoMode`
+    - `security`:
+      - `trustedElevated`: array of fingerprints
+      - `rateLimit`: `{ windowMs, maxMessages, banMs }`
+    - `peerServer`:
+      - `useCustom`, `host`, `port`, `path`, `secure`
+    - `turn`:
+      - `enabled`, `host`, `port`, `username`, `credential`, `useTLS`
 
-### Data Structures
+## Event Structure (signed + hash-chained)
 
-```json
-// Identity
-"meshdesk_identity": {
-  "peerId": "meshdesk-abc123def456",
-  "publicKeyFingerprint": "a3f2:c9b1:...",
-  "displayName": "Agent Smith",
-  "role": "L2",
-  "status": "Online",
-  "createdAt": "2026-03-13T..."
+```
+{
+  "id": "evt_...",
+  "type": "TicketCreated" | "TicketAssigned" | "TicketEscalated" | "TicketResolved" | "TicketClosed" | "TicketReopened" | "MessageSent" | ...,
+  "ticketId": "#abc123",
+  "actor": "Agent Name",
+  "actorRole": "L1" | "L2" | "Senior" | "Supervisor" | "Customer",
+  "actorPeerId": "peer-...",
+  "actorFingerprint": "abcd:1234:...",
+  "actorPublicKeyJwk": { ... },
+  "ts": "2026-03-16T...Z",
+  "detail": "...",
+  "ticketHash": "sha256(...)",
+  "clock": 42,
+  "seq": 17,
+  "sig": "base64(ecdsa)",
+  "prevHash": "sha256(...)",
+  "chainHash": "sha256(prevHash + eventPayload)"
 }
-
-// Full app state
-"meshdesk_state": {
-  "agents": [...],
-  "tickets": [...],
-  "events": [...]
-}
-
-// Settings
-"meshdesk_settings": { "theme": "dark", "sidebarCollapsed": false, "roomId": "meshdesk-global" }
 ```
 
-### P2P Protocol Messages
+Notes:
+- `sig` signs the event payload (not the chain hash).
+- `prevHash`/`chainHash` form a hash-chained log over the bounded event window.
 
-```json
-// Broadcast event
-{ "type": "event", "payload": { "eventType": "TicketCreated", ... } }
+## Ticket Structure (core fields)
 
-// Full state sync (on new peer join)
-{ "type": "state_sync", "payload": { "tickets": [...], "events": [...] } }
-
-// Peer announce (identity broadcast)
-{ "type": "announce", "payload": { "peerId": "...", "displayName": "...", "role": "...", "status": "..." } }
-
-// Peer list (hub sends list of existing peers to new joiner)
-{ "type": "peer_list", "payload": ["peer-id-1", "peer-id-2"] }
+```
+{
+  "id": "#abc123",
+  "subject": "...",
+  "customer": "Customer Name",
+  "customerPeerId": "peer-...",
+  "agent": "Agent Name",
+  "agentId": "peer-...",
+  "status": "Open" | "In Progress" | "Waiting" | "Escalated" | "Resolved" | "Closed",
+  "priority": "Low" | "Medium" | "High" | "Critical",
+  "messages": [ ... ],
+  "created": "2026-03-16T...Z",
+  "updated": "2026-03-16T...Z",
+  "clock": 42,
+  "updatedByFingerprint": "abcd:1234:...",
+  "updatedByPeerId": "peer-..."
+}
 ```
 
-### No API Endpoints Used
-- Fully client-side application
-- PeerJS uses its free signaling server (0.peerjs.com) for connection brokering only
-- All data transfer is direct WebRTC peer-to-peer
+## Snapshot Envelope (signed)
+
+```
+{
+  "type": "snapshot",
+  "snapshot": {
+    "tickets": [ ... ],
+    "events": [ ... ],
+    "meta": {
+      "snapshotVersion": 1,
+      "snapshotSeq": 12,
+      "eventSeq": 41,
+      "eventChainVersion": 1,
+      "eventLogHash": "sha256(...)",
+      "eventLogHashAlgo": "sha256"
+    }
+  },
+  "signer": {
+    "peerId": "peer-...",
+    "fingerprint": "abcd:1234:...",
+    "publicKeyJwk": { ... }
+  },
+  "sig": "base64(ecdsa)"
+}
+```
+
+## P2P Protocol Messages
+
+- `hello`
+  - `{ type: "hello", identity: { ... }, sig }`
+
+- `event`
+  - `{ type: "event", event, ticket }`
+
+- `req_snapshot`
+  - `{ type: "req_snapshot" }`
+
+- `snapshot`
+  - `{ type: "snapshot", snapshot, signer, sig }`
+
+## Notes
+
+- All data is client-side only; PeerJS is used for signaling and WebRTC data channels.
+- Events and snapshots are verified by signature; snapshots also validate event log hash and signer fingerprint.
