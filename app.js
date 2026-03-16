@@ -112,6 +112,27 @@ const downloadJson = (filename, payload) => {
     URL.revokeObjectURL(url);
   } catch (e) {}
 };
+const downloadCsv = (filename, rows) => {
+  try {
+    const escape = (val) => {
+      const s = String(val ?? '');
+      if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+        return `"${s.replace(/\"/g, '""')}"`;
+      }
+      return s;
+    };
+    const csv = rows.map(row => row.map(escape).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {}
+};
 
 // ============ DATA GENERATION ============
 const AGENT_NAMES = ['Alex Chen', 'Maya Johnson', 'Raj Patel', 'Sofia Martinez', 'Liam O\'Brien', 'Yuki Tanaka', 'Awa Diallo', 'Marcus Weber'];
@@ -214,6 +235,7 @@ function loadSettings() {
     demoMode: false,
     security: {
       trustedElevated: [],
+      mutedPeers: [],
       rateLimit: { windowMs: 10000, maxMessages: 40, banMs: 60000 }
     },
     peerServer: {
@@ -242,6 +264,7 @@ function loadSettings() {
         security: {
           ...defaults.security,
           ...(parsed.security || {}),
+          mutedPeers: parsed.security?.mutedPeers || defaults.security.mutedPeers,
           rateLimit: { ...defaults.security.rateLimit, ...(parsed.security?.rateLimit || {}) }
         },
         peerServer: { ...defaults.peerServer, ...(parsed.peerServer || {}) },
@@ -622,8 +645,8 @@ function App() {
     setShowOnboarding(false);
   };
 
-  const logAudit = useCallback((msg, level = 'warning', peerIdToLog = null) => {
-    const entry = { id: genId(), ts: new Date().toISOString(), msg, level, peerId: peerIdToLog };
+  const logAudit = useCallback((msg, level = 'warning', peerIdToLog = null, meta = {}) => {
+    const entry = { id: genId(), ts: new Date().toISOString(), msg, level, peerId: peerIdToLog, ...meta };
     setAuditLog(prev => [entry, ...prev].slice(0, 200));
   }, []);
 
@@ -756,6 +779,8 @@ function App() {
   }, [knownPeersById]);
 
   const shouldAllowInbound = useCallback((peerIdToCheck) => {
+    const muted = settings.security?.mutedPeers || [];
+    if (muted.includes(peerIdToCheck)) return false;
     const rate = settings.security?.rateLimit || { windowMs: 10000, maxMessages: 40, banMs: 60000 };
     const now = Date.now();
     const entry = peerRateRef.current.get(peerIdToCheck) || { count: 0, windowStart: now, bannedUntil: 0 };
@@ -909,39 +934,40 @@ function App() {
   const handleIncomingSnapshot = useCallback(async (data, peerIdToCheck) => {
     if (!data?.snapshot) return;
     if (!shouldAllowInbound(peerIdToCheck)) return;
+    const signerFingerprint = data?.signer?.fingerprint || null;
     const verified = await verifySignedSnapshot(data);
     if (!verified) {
       logSync(`Invalid snapshot signature from ${peerIdToCheck}`, 'warning');
-      logAudit(`Invalid snapshot signature`, 'warning', peerIdToCheck);
+      logAudit(`Invalid snapshot signature`, 'warning', peerIdToCheck, { signerFingerprint });
       return;
     }
     const signerOk = await verifySnapshotSigner(data, peerIdToCheck);
     if (!signerOk) {
       logSync(`Snapshot signer mismatch from ${peerIdToCheck}`, 'warning');
-      logAudit(`Snapshot signer mismatch`, 'warning', peerIdToCheck);
+      logAudit(`Snapshot signer mismatch`, 'warning', peerIdToCheck, { signerFingerprint });
       return;
     }
     const eventLog = await computeEventLogHash(data.snapshot?.events || []);
     if (!eventLog.ok) {
       logSync(`Snapshot event chain invalid from ${peerIdToCheck}`, 'warning');
-      logAudit(`Snapshot event chain invalid`, 'warning', peerIdToCheck);
+      logAudit(`Snapshot event chain invalid`, 'warning', peerIdToCheck, { signerFingerprint });
       return;
     }
     const maxSeq = (data.snapshot?.events || []).reduce((m, e) => Math.max(m, e.seq || 0), 0);
     if (data.snapshot?.meta?.eventSeq && maxSeq > data.snapshot.meta.eventSeq) {
       logSync(`Snapshot event sequence invalid from ${peerIdToCheck}`, 'warning');
-      logAudit(`Snapshot event sequence invalid`, 'warning', peerIdToCheck);
+      logAudit(`Snapshot event sequence invalid`, 'warning', peerIdToCheck, { signerFingerprint });
       return;
     }
     const declaredHash = data.snapshot?.meta?.eventLogHash;
     if (declaredHash && declaredHash !== eventLog.hash) {
       logSync(`Snapshot event log hash mismatch from ${peerIdToCheck}`, 'warning');
-      logAudit(`Snapshot event log hash mismatch`, 'warning', peerIdToCheck);
+      logAudit(`Snapshot event log hash mismatch`, 'warning', peerIdToCheck, { signerFingerprint });
       return;
     }
     if (!declaredHash) {
       logSync(`Snapshot missing event log hash from ${peerIdToCheck}`, 'warning');
-      logAudit(`Snapshot missing event log hash`, 'info', peerIdToCheck);
+      logAudit(`Snapshot missing event log hash`, 'info', peerIdToCheck, { signerFingerprint });
     }
     applySnapshot(data.snapshot);
   }, [applySnapshot, computeEventLogHash, logAudit, logSync, shouldAllowInbound, verifySignedSnapshot, verifySnapshotSigner]);
@@ -1011,17 +1037,27 @@ function App() {
     if (!shouldAllowInbound(peerIdToCheck)) return;
     const evt = payload.event;
     const evtLabel = `${evt.type || 'Event'} id=${evt.id || 'unknown'} ticket=${evt.ticketId || 'n/a'} actor=${evt.actor || 'unknown'}`;
+    const evtMeta = {
+      eventId: evt.id || null,
+      ticketId: evt.ticketId || null,
+      actor: evt.actor || null,
+      actorRole: evt.actorRole || null,
+      actorPeerId: evt.actorPeerId || null,
+      actorFingerprint: evt.actorFingerprint || null,
+      eventType: evt.type || null,
+      seq: evt.seq || null
+    };
     const verified = await verifySignedEvent(evt);
     if (!verified) {
       logSync(`Invalid signature from ${peerIdToCheck}`, 'warning');
-      logAudit(`Invalid event signature (${evtLabel})`, 'warning', peerIdToCheck);
+      logAudit(`Invalid event signature (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
       return;
     }
     if (payload.ticket && evt.ticketHash) {
       const computed = await hashPayload(payload.ticket);
       if (computed !== evt.ticketHash) {
         logSync(`Ticket hash mismatch from ${peerIdToCheck}`, 'warning');
-        logAudit(`Ticket hash mismatch (${evtLabel})`, 'warning', peerIdToCheck);
+        logAudit(`Ticket hash mismatch (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
         return;
       }
     }
@@ -1030,13 +1066,13 @@ function App() {
       const expected = await hashPayload({ prevHash, event: getEventChainPayload(evt) });
       if (expected !== evt.chainHash) {
         logSync(`Event chain hash invalid from ${peerIdToCheck}`, 'warning');
-        logAudit(`Event chain hash invalid (${evtLabel})`, 'warning', peerIdToCheck);
+        logAudit(`Event chain hash invalid (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
         return;
       }
       const hasPrev = stateRef.current.events.some(e => e.chainHash === prevHash);
       if (evt.prevHash && !hasPrev) {
         logSync(`Event chain link missing from ${peerIdToCheck}`, 'warning');
-        logAudit(`Event chain link missing (${evtLabel})`, 'info', peerIdToCheck);
+        logAudit(`Event chain link missing (${evtLabel})`, 'info', peerIdToCheck, evtMeta);
       }
     }
     const existingTicket = payload.ticket ? stateRef.current.tickets.find(t => t.id === payload.ticket.id) : null;
@@ -1049,7 +1085,7 @@ function App() {
     });
     if (!isAuthorizedEvent(evt, payload.ticket, existingTicket)) {
       logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
-      logAudit(`Unauthorized event blocked (${evtLabel})`, 'warning', peerIdToCheck);
+      logAudit(`Unauthorized event blocked (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
       return;
     }
     applyEvent(evt, payload.ticket);
@@ -1772,7 +1808,81 @@ function App() {
             onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS,
             knownPeersById
           }),
-          view === 'audit' && h(AuditView, { auditLog, isDark }),
+          view === 'audit' && h(AuditView, {
+            auditLog,
+            isDark,
+            onTrustSigner: (fingerprint) => {
+              if (!fingerprint) return;
+              setSettings(s => ({
+                ...s,
+                security: {
+                  ...s.security,
+                  trustedElevated: Array.from(new Set([fingerprint, ...(s.security?.trustedElevated || [])]))
+                }
+              }));
+            },
+            onRequestSnapshot: requestSnapshotFromPeer,
+            onMutePeer: (peerIdToMute) => {
+              if (!peerIdToMute) return;
+              setSettings(s => ({
+                ...s,
+                security: {
+                  ...s.security,
+                  mutedPeers: Array.from(new Set([peerIdToMute, ...(s.security?.mutedPeers || [])]))
+                }
+              }));
+              logAudit(`Peer muted locally`, 'warning', peerIdToMute);
+            },
+            onUnmutePeer: (peerIdToUnmute) => {
+              if (!peerIdToUnmute) return;
+              setSettings(s => ({
+                ...s,
+                security: {
+                  ...s.security,
+                  mutedPeers: (s.security?.mutedPeers || []).filter(p => p !== peerIdToUnmute)
+                }
+              }));
+              logAudit(`Peer unmuted locally`, 'info', peerIdToUnmute);
+            },
+            onViewTicket: (ticketId) => {
+              if (!ticketId) return;
+              setSelectedTicketId(ticketId);
+              setView('tickets');
+            },
+            onCopyDetails: async (entry) => {
+              if (!entry) return;
+              const details = {
+                eventId: entry.eventId || null,
+                ticketId: entry.ticketId || null,
+                actor: entry.actor || null,
+                actorRole: entry.actorRole || null,
+                actorPeerId: entry.actorPeerId || null,
+                actorFingerprint: entry.actorFingerprint || entry.signerFingerprint || null,
+                eventType: entry.eventType || null,
+                seq: entry.seq || null,
+                peerId: entry.peerId || null,
+                ts: entry.ts || null,
+                msg: entry.msg || null
+              };
+              const text = JSON.stringify(details, null, 2);
+              try { await navigator.clipboard.writeText(text); } catch (e) {}
+            },
+            onExportJson: () => downloadJson(`meshdesk-audit-${new Date().toISOString()}.json`, auditLog),
+            onExportCsv: () => {
+              const rows = [
+                ['ts', 'level', 'peerId', 'eventId', 'ticketId', 'actor', 'actorPeerId', 'actorFingerprint', 'eventType', 'message']
+              ];
+              (auditLog || []).forEach(e => {
+                rows.push([
+                  e.ts, e.level, e.peerId, e.eventId, e.ticketId, e.actor,
+                  e.actorPeerId, e.actorFingerprint || e.signerFingerprint, e.eventType, e.msg
+                ]);
+              });
+              downloadCsv(`meshdesk-audit-${new Date().toISOString()}.csv`, rows);
+            },
+            mutedPeers: settings.security?.mutedPeers || [],
+            trustedElevated: settings.security?.trustedElevated || []
+          }),
             view === 'settings' && h(SettingsView, { identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
         ),
 
@@ -2758,12 +2868,35 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
 }
 
 // ============ AUDIT VIEW ============
-function AuditView({ auditLog, isDark }) {
+function AuditView({ auditLog, isDark, onTrustSigner, onRequestSnapshot, onMutePeer, onUnmutePeer, onViewTicket, onCopyDetails, onExportJson, onExportCsv, mutedPeers, trustedElevated }) {
+  const [filterPeer, setFilterPeer] = useState('all');
+  const [filterLevel, setFilterLevel] = useState('all');
+  const [filterType, setFilterType] = useState('all');
   const levelStyle = (level) => {
     if (level === 'error') return isDark ? 'text-red-400' : 'text-red-600';
     if (level === 'warning') return isDark ? 'text-amber-400' : 'text-amber-600';
     return isDark ? 'text-slate-400' : 'text-slate-500';
   };
+  const isMuted = (peerId) => (mutedPeers || []).includes(peerId);
+  const isTrusted = (fingerprint) => (trustedElevated || []).includes(fingerprint);
+  const peerOptions = useMemo(() => {
+    const set = new Set();
+    (auditLog || []).forEach(e => { if (e.peerId) set.add(e.peerId); });
+    return Array.from(set);
+  }, [auditLog]);
+  const typeOptions = useMemo(() => {
+    const set = new Set();
+    (auditLog || []).forEach(e => { if (e.eventType) set.add(e.eventType); });
+    return Array.from(set);
+  }, [auditLog]);
+  const filtered = useMemo(() => {
+    return (auditLog || []).filter(e => {
+      if (filterPeer !== 'all' && e.peerId !== filterPeer) return false;
+      if (filterLevel !== 'all' && (e.level || 'info') !== filterLevel) return false;
+      if (filterType !== 'all' && e.eventType !== filterType) return false;
+      return true;
+    });
+  }, [auditLog, filterLevel, filterPeer, filterType]);
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-4 max-w-4xl' },
     h('div', { className: 'flex items-center justify-between' },
@@ -2771,23 +2904,96 @@ function AuditView({ auditLog, isDark }) {
         h('div', { className: 'text-lg font-semibold' }, 'Audit Log'),
         h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Signature failures, snapshot mismatches, rate-limit actions, and other security-related events.')
       ),
-      h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, `${auditLog.length} entries`)
+      h('div', { className: 'flex items-center gap-2' },
+        h('button', { onClick: onExportJson, className: `px-3 py-1.5 text-xs rounded-lg border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Export JSON'),
+        h('button', { onClick: onExportCsv, className: `px-3 py-1.5 text-xs rounded-lg border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Export CSV'),
+        h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, `${filtered.length} entries`)
+      ),
     ),
-    auditLog.length === 0 && h('div', { className: `text-sm ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No audit events yet.'),
-    auditLog.length > 0 && h('div', { className: `rounded-xl border ${isDark ? 'border-slate-800 bg-slate-900/40' : 'border-slate-200 bg-white'}` },
+    h('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
+      h('div', null,
+        h('label', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'} block mb-1` }, 'Peer'),
+        h('select', {
+          value: filterPeer,
+          onChange: e => setFilterPeer(e.target.value),
+          className: `w-full px-3 py-2 text-xs rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        },
+          h('option', { value: 'all' }, 'All peers'),
+          peerOptions.map(p => h('option', { key: p, value: p }, p))
+        )
+      ),
+      h('div', null,
+        h('label', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'} block mb-1` }, 'Level'),
+        h('select', {
+          value: filterLevel,
+          onChange: e => setFilterLevel(e.target.value),
+          className: `w-full px-3 py-2 text-xs rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        },
+          h('option', { value: 'all' }, 'All levels'),
+          h('option', { value: 'error' }, 'Error'),
+          h('option', { value: 'warning' }, 'Warning'),
+          h('option', { value: 'info' }, 'Info')
+        )
+      ),
+      h('div', null,
+        h('label', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'} block mb-1` }, 'Event Type'),
+        h('select', {
+          value: filterType,
+          onChange: e => setFilterType(e.target.value),
+          className: `w-full px-3 py-2 text-xs rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        },
+          h('option', { value: 'all' }, 'All types'),
+          typeOptions.map(t => h('option', { key: t, value: t }, t))
+        )
+      )
+    ),
+    filtered.length === 0 && h('div', { className: `text-sm ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No audit events yet.'),
+    filtered.length > 0 && h('div', { className: `rounded-xl border ${isDark ? 'border-slate-800 bg-slate-900/40' : 'border-slate-200 bg-white'}` },
       h('div', { className: `grid grid-cols-12 gap-2 px-4 py-2 text-xs uppercase tracking-wide ${isDark ? 'text-slate-500 border-b border-slate-800' : 'text-slate-400 border-b border-slate-200'}` },
         h('div', { className: 'col-span-2' }, 'Time'),
         h('div', { className: 'col-span-2' }, 'Level'),
-        h('div', { className: 'col-span-3' }, 'Peer'),
-        h('div', { className: 'col-span-5' }, 'Message')
+        h('div', { className: 'col-span-2' }, 'Peer'),
+        h('div', { className: 'col-span-4' }, 'Message'),
+        h('div', { className: 'col-span-2' }, 'Actions')
       ),
       h('div', { className: 'divide-y ' + (isDark ? 'divide-slate-800' : 'divide-slate-100') },
-        auditLog.map(entry =>
+        filtered.map(entry =>
           h('div', { key: entry.id, className: 'grid grid-cols-12 gap-2 px-4 py-2 text-xs items-start' },
             h('div', { className: `col-span-2 ${isDark ? 'text-slate-400' : 'text-slate-500'}` }, new Date(entry.ts).toLocaleTimeString()),
             h('div', { className: `col-span-2 font-medium ${levelStyle(entry.level)}` }, entry.level || 'info'),
-            h('div', { className: `col-span-3 font-mono break-all ${isDark ? 'text-slate-300' : 'text-slate-700'}` }, entry.peerId || '—'),
-            h('div', { className: `col-span-5 ${isDark ? 'text-slate-200' : 'text-slate-700'}` }, entry.msg)
+            h('div', { className: `col-span-2 font-mono break-all ${isDark ? 'text-slate-300' : 'text-slate-700'}` }, entry.peerId || '—'),
+            h('div', { className: `col-span-4 ${isDark ? 'text-slate-200' : 'text-slate-700'}` }, entry.msg),
+            h('div', { className: 'col-span-2 flex flex-wrap gap-1' },
+              h('button', {
+                onClick: () => onCopyDetails?.(entry),
+                className: `px-2 py-1 rounded border text-[11px] ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}`
+              }, 'Copy'),
+              entry.ticketId && h('button', {
+                onClick: () => onViewTicket?.(entry.ticketId),
+                className: `px-2 py-1 rounded border text-[11px] ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}`
+              }, 'View'),
+              (entry.actorFingerprint || entry.signerFingerprint) && (() => {
+                const fp = entry.actorFingerprint || entry.signerFingerprint;
+                const trusted = isTrusted(fp);
+                return h('button', {
+                  onClick: () => { if (!trusted) onTrustSigner?.(fp); },
+                  disabled: trusted,
+                  className: `px-2 py-1 rounded border text-[11px] ${trusted ? (isDark ? 'border-emerald-700 text-emerald-300' : 'border-emerald-200 text-emerald-700') : (isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900')}`
+                }, trusted ? 'Trusted' : 'Trust');
+              })(),
+              entry.peerId && h('button', {
+                onClick: () => onRequestSnapshot?.(entry.peerId),
+                className: `px-2 py-1 rounded border text-[11px] ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}`
+              }, 'Snapshot'),
+              entry.peerId && !isMuted(entry.peerId) && h('button', {
+                onClick: () => onMutePeer?.(entry.peerId),
+                className: `px-2 py-1 rounded border text-[11px] ${isDark ? 'border-amber-700 text-amber-300 hover:text-white' : 'border-amber-200 text-amber-600 hover:text-amber-900'}`
+              }, 'Mute'),
+              entry.peerId && isMuted(entry.peerId) && h('button', {
+                onClick: () => onUnmutePeer?.(entry.peerId),
+                className: `px-2 py-1 rounded border text-[11px] ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}`
+              }, 'Unmute')
+            )
           )
         )
       )
