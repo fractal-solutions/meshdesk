@@ -8,6 +8,10 @@ This build includes security and consistency hardening:
 - Per-peer rate limits with soft bans to reduce spam/flooding.
 - Role enforcement and trusted-elevated allowlist for sensitive actions.
 - Snapshot versioning metadata and bounded event history (last 200 events).
+- Offline outbox for guaranteed delivery after reconnect.
+- SLA timers with automated escalation rules and supervisor alerts.
+- Ticket-level access control (ACL) scaffolding for restricted visibility.
+- Recovery phrase + encrypted identity bundle + key rotation.
 
 ## Quick Start (Local)
 
@@ -50,13 +54,13 @@ If you clear storage, you will generate a new identity and appear as a new peer.
 ### Trusted Elevated Allowlist
 Certain actions (escalations and supervisor overrides) are locked behind a local allowlist.
 
-Open **Settings → Trust & Role Enforcement**:
-1. Copy a trusted peer’s fingerprint from the “Known peers” list.
+Open **Settings -> Trust & Role Enforcement**:
+1. Copy a trusted peer's fingerprint from the "Known peers" list.
 2. Add it to the allowlist.
 
 Behavior:
 - Only fingerprints in this list can perform escalations and supervisor overrides.
-- “Resolve” is allowed for the assigned agent or a trusted elevated peer.
+- "Resolve" is allowed for the assigned agent or a trusted elevated peer.
 - Customers cannot claim, escalate, or resolve.
 
 This is intentionally local policy: each browser decides who it trusts for elevated actions.
@@ -69,7 +73,7 @@ MeshDesk uses Lamport clocks to deterministically resolve ticket conflicts:
 - Ticket updates apply if `clock` is higher; ties break on `updated` timestamp and then fingerprint.
 
 Result:
-- No advantage to “racing” timestamps.
+- No advantage to "racing" timestamps.
 - Peers converge on a consistent ticket state.
 
 ## Sync and Snapshot Details
@@ -100,9 +104,59 @@ To adjust limits:
 
 ## Local Storage Keys
 
-- `meshdesk_identity`: keypair, fingerprint, display name, role
+- `meshdesk_identity`: keypair, fingerprint, display name, role, rotation metadata
 - `meshdesk_state`: tickets, events, meta (Lamport/event/snapshot counters)
-- `meshdesk_settings`: theme, network config, trust list, rate limits
+- `meshdesk_settings`: theme, network config, trust list, rate limits, SLA policy, governance
+- `meshdesk_outbox`: offline outbound queue (events and governance messages)
+- `meshdesk_peer_votes`: local governance vote tally (per peer)
+- `meshdesk_peer_reputation`: local reputation scores
+
+## Governance Controls (Local)
+
+MeshDesk includes lightweight, local-only governance:
+- **Vote-to-mute**: peers can broadcast signed votes against a peer.
+- **Quarantine**: once vote weight meets the local threshold, the peer is quarantined and inbound messages are ignored.
+- **Reputation-backed votes**: votes are weighted by local reputation (higher-reputation peers count more).
+
+Configure in **Settings -> Governance Controls**:
+- **Vote Threshold (weight)**: how much vote weight is required to quarantine.
+- **Quarantined Peers**: list of currently quarantined peers with release controls.
+
+## Offline Outbox (Guaranteed Delivery)
+
+When you are offline or have no open connections, outbound events are queued locally.
+On reconnect, the outbox automatically flushes to connected peers. You can also
+manually **Flush Outbox** or **Clear** it in the Network view.
+
+## SLA Timers & Escalation Rules
+
+Each ticket carries an SLA window based on priority:
+- Low, Medium, High, Critical targets (minutes)
+- Auto-escalate if unassigned beyond threshold
+- Auto-escalate Critical immediately
+- Supervisor alert after a longer unresolved threshold
+
+These rules run locally and emit signed events:
+- `SlaBreached`
+- `SupervisorAlerted`
+
+Configure in `meshdesk_settings.sla`.
+
+## Ticket-Level Access Control (ACL)
+
+Tickets include a local ACL scaffold:
+- `mode: "public" | "restricted"`
+- `roles`, `peers`, `fingerprints` allowlists
+
+When `mode` is `restricted`, tickets are only visible to allowed peers.
+
+## Recovery Phrase & Key Rotation
+
+In **Settings -> Recovery Phrase & Rotation** you can:
+- Generate a recovery phrase (base32 + checksum)
+- Export an encrypted identity bundle
+- Import a recovery bundle with the phrase
+- Rotate your keypair (creates a signed rotation proof)
 
 ## Running Your Own PeerJS Server (Signaling)
 
@@ -117,7 +171,7 @@ peerjs --port 9000 --path /peerjs
 
 ### Configure the App
 
-In **Settings → PeerJS Signaling**:
+In **Settings -> PeerJS Signaling**:
 - Use Custom PeerJS Server: **on**
 - Host: `your-hostname-or-ip`
 - Port: `9000`
@@ -189,7 +243,7 @@ sudo systemctl status coturn
 
 ### Configure the App
 
-In **Settings → TURN Relay**:
+In **Settings -> TURN Relay**:
 - Enable TURN: **on**
 - Host: `turn.your-domain.com` (or public IP)
 - Port: `3478`
@@ -198,7 +252,7 @@ In **Settings → TURN Relay**:
 
 ## Troubleshooting
 
-### ICE Stuck at `checking → disconnected`
+### ICE Stuck at `checking -> disconnected`
 This almost always means TURN is unreachable or misconfigured.
 
 Checklist:
@@ -207,9 +261,9 @@ Checklist:
 - `turnserver.log` shows allocation attempts.
 
 ### No Sync After Connect
-If the Network log shows “Connected” but no “Snapshot synced”:
+If the Network log shows "Connected" but no "Snapshot synced":
 - Click **Sync Now** and **Request Sync**.
-- If it says “No open connections to sync,” the data channel did not open.
+- If it says "No open connections to sync," the data channel did not open.
 - Enable TURN and reconnect.
 
 ## Notes

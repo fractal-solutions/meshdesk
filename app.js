@@ -10,6 +10,8 @@ const timeAgo = (ts) => {
   if (diff < 86400000) return Math.floor(diff/3600000) + 'h ago';
   return Math.floor(diff/86400000) + 'd ago';
 };
+const addMinutes = (iso, mins) => new Date(new Date(iso).getTime() + mins * 60000).toISOString();
+const minutesSince = (iso) => (Date.now() - new Date(iso).getTime()) / 60000;
 const genAvatar = (seed) => {
   const colors = ['#6366F1','#EC4899','#10B981','#F59E0B','#3B82F6','#8B5CF6','#EF4444','#14B8A6'];
   const c = colors[Math.abs(seed.split('').reduce((a,b) => a + b.charCodeAt(0), 0)) % colors.length];
@@ -22,6 +24,47 @@ const bufferToHex = (buffer) => Array.from(new Uint8Array(buffer)).map(b => b.to
 const bufferToBase64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer)));
 const base64ToBuffer = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
 const EVENT_CHAIN_GENESIS = '0'.repeat(64);
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const encodeBase32 = (buffer) => {
+  const bytes = new Uint8Array(buffer);
+  let bits = 0;
+  let value = 0;
+  let output = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return output;
+};
+const decodeBase32 = (str) => {
+  const clean = (str || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0;
+  let value = 0;
+  const bytes = [];
+  for (const ch of clean) {
+    const idx = BASE32_ALPHABET.indexOf(ch);
+    if (idx < 0) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(bytes).buffer;
+};
+const formatRecoveryPhrase = (base32) => {
+  const clean = base32.replace(/[^A-Z2-7]/gi, '').toUpperCase();
+  return clean.match(/.{1,4}/g)?.join('-') || clean;
+};
+const parseRecoveryPhrase = (phrase) => (phrase || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
@@ -98,6 +141,67 @@ const verifyPayload = async (publicKeyJwk, payload, signature) => {
   } catch (e) {
     return false;
   }
+};
+const generateRecoveryPhrase = async () => {
+  const entropy = crypto.getRandomValues(new Uint8Array(16));
+  const checksum = await crypto.subtle.digest('SHA-256', entropy);
+  const checksumBytes = new Uint8Array(checksum).slice(0, 2);
+  const combined = new Uint8Array(18);
+  combined.set(entropy, 0);
+  combined.set(checksumBytes, 16);
+  return formatRecoveryPhrase(encodeBase32(combined));
+};
+const verifyRecoveryPhrase = async (phrase) => {
+  try {
+    const raw = decodeBase32(parseRecoveryPhrase(phrase));
+    const bytes = new Uint8Array(raw);
+    if (bytes.length < 18) return false;
+    const entropy = bytes.slice(0, 16);
+    const checksum = bytes.slice(16, 18);
+    const digest = await crypto.subtle.digest('SHA-256', entropy);
+    const digestBytes = new Uint8Array(digest).slice(0, 2);
+    return checksum[0] === digestBytes[0] && checksum[1] === digestBytes[1];
+  } catch (e) {
+    return false;
+  }
+};
+const deriveRecoveryKey = async (phrase, salt, iterations = 200000) => {
+  const phraseData = textEncoder.encode(parseRecoveryPhrase(phrase));
+  const baseKey = await crypto.subtle.importKey('raw', phraseData, { name: 'PBKDF2' }, false, ['deriveKey']);
+  return await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+};
+const encryptIdentityBundle = async (identity, phrase) => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveRecoveryKey(phrase, salt);
+  const payload = textEncoder.encode(JSON.stringify(identity));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, payload);
+  return {
+    version: 1,
+    kdf: 'PBKDF2-SHA256',
+    iterations: 200000,
+    salt: bufferToBase64(salt),
+    iv: bufferToBase64(iv),
+    ciphertext: bufferToBase64(ciphertext)
+  };
+};
+const decryptIdentityBundle = async (bundle, phrase) => {
+  const salt = new Uint8Array(base64ToBuffer(bundle.salt || ''));
+  const iv = new Uint8Array(base64ToBuffer(bundle.iv || ''));
+  const iterations = bundle.iterations || 200000;
+  const key = await deriveRecoveryKey(phrase, salt, iterations);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    base64ToBuffer(bundle.ciphertext || '')
+  );
+  return JSON.parse(new TextDecoder().decode(plaintext));
 };
 const downloadJson = (filename, payload) => {
   try {
@@ -236,6 +340,8 @@ function loadSettings() {
     security: {
       trustedElevated: [],
       mutedPeers: [],
+      quarantinedPeers: [],
+      voteThreshold: 2,
       rateLimit: { windowMs: 10000, maxMessages: 40, banMs: 60000 }
     },
     peerServer: {
@@ -252,6 +358,13 @@ function loadSettings() {
       username: '',
       credential: '',
       useTLS: false
+    },
+    sla: {
+      enabled: true,
+      targetsMins: { Low: 480, Medium: 240, High: 120, Critical: 60 },
+      autoEscalateAfterMins: 10,
+      autoEscalateCritical: true,
+      supervisorAlertAfterMins: 30
     }
   };
   try {
@@ -265,10 +378,17 @@ function loadSettings() {
           ...defaults.security,
           ...(parsed.security || {}),
           mutedPeers: parsed.security?.mutedPeers || defaults.security.mutedPeers,
+          quarantinedPeers: parsed.security?.quarantinedPeers || defaults.security.quarantinedPeers,
+          voteThreshold: parsed.security?.voteThreshold ?? defaults.security.voteThreshold,
           rateLimit: { ...defaults.security.rateLimit, ...(parsed.security?.rateLimit || {}) }
         },
         peerServer: { ...defaults.peerServer, ...(parsed.peerServer || {}) },
-        turn: { ...defaults.turn, ...(parsed.turn || {}) }
+        turn: { ...defaults.turn, ...(parsed.turn || {}) },
+        sla: {
+          ...defaults.sla,
+          ...(parsed.sla || {}),
+          targetsMins: { ...defaults.sla.targetsMins, ...(parsed.sla?.targetsMins || {}) }
+        }
       };
     }
   } catch(e) {}
@@ -277,6 +397,21 @@ function loadSettings() {
 
 function saveSettings(s) {
   try { localStorage.setItem('meshdesk_settings', JSON.stringify(s)); } catch(e) {}
+}
+
+function loadOutbox() {
+  try {
+    const saved = localStorage.getItem('meshdesk_outbox');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveOutbox(outbox) {
+  try { localStorage.setItem('meshdesk_outbox', JSON.stringify(outbox)); } catch (e) {}
 }
 
 function loadIdentity() {
@@ -440,6 +575,7 @@ function App() {
   const [showOnboarding, setShowOnboarding] = useState(!loadIdentity());
   const [view, setView] = useState('dashboard');
   const [state, setState] = useState(() => loadState() || generateInitialData());
+  const [outbox, setOutbox] = useState(loadOutbox);
   const [selectedTicketId, setSelectedTicketId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(!settings.sidebarCollapsed);
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -456,10 +592,25 @@ function App() {
   const [connections, setConnections] = useState([]);
   const [knownPeers, setKnownPeers] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
+  const [peerVotes, setPeerVotes] = useState(() => {
+    try {
+      const saved = localStorage.getItem('meshdesk_peer_votes');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
+  const [peerReputation, setPeerReputation] = useState(() => {
+    try {
+      const saved = localStorage.getItem('meshdesk_peer_reputation');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return {};
+  });
   const [peerRestartNonce, setPeerRestartNonce] = useState(0);
   const peerRef = useRef(null);
   const connsRef = useRef(new Map());
   const stateRef = useRef(state);
+  const outboxRef = useRef(outbox);
   const suppressBroadcastRef = useRef(false);
   const seenEventsRef = useRef(new Set());
   const lamportRef = useRef(state.meta?.lamport || 0);
@@ -490,6 +641,16 @@ function App() {
   useEffect(() => { saveState(state); }, [state]);
   useEffect(() => { saveSettings(settings); }, [settings]);
   useEffect(() => { stateRef.current = state; }, [state]);
+  useEffect(() => {
+    try { localStorage.setItem('meshdesk_peer_votes', JSON.stringify(peerVotes || {})); } catch (e) {}
+  }, [peerVotes]);
+  useEffect(() => {
+    try { localStorage.setItem('meshdesk_peer_reputation', JSON.stringify(peerReputation || {})); } catch (e) {}
+  }, [peerReputation]);
+  useEffect(() => {
+    outboxRef.current = outbox;
+    saveOutbox(outbox);
+  }, [outbox]);
   useEffect(() => { identityRef.current = identity; }, [identity]);
   useEffect(() => {
     lamportRef.current = state.meta?.lamport || lamportRef.current || 0;
@@ -655,6 +816,65 @@ function App() {
     setSyncLog(prev => [entry, ...prev].slice(0, 80));
   }, []);
 
+  const sendToOpenConnections = useCallback((payload) => {
+    let sent = 0;
+    connsRef.current.forEach(conn => {
+      if (conn.open) {
+        try {
+          conn.send(payload);
+          sent += 1;
+        } catch (e) {}
+      }
+    });
+    return sent;
+  }, []);
+
+  const enqueueOutbound = useCallback((payload, reason = 'offline') => {
+    if (!payload) return;
+    const entry = {
+      id: genId(),
+      payload,
+      reason,
+      createdAt: new Date().toISOString(),
+      attempts: 0,
+      lastAttempt: null
+    };
+    setOutbox(prev => [...prev, entry].slice(-500));
+    logSync(`Queued outbound ${payload.type || 'payload'} (${reason})`, 'warning');
+  }, [logSync]);
+
+  const flushOutbox = useCallback((reason = 'auto') => {
+    if (!outboxRef.current.length) return;
+    const openCount = Array.from(connsRef.current.values()).filter(c => c.open).length;
+    if (!openCount) {
+      logSync('Outbox flush skipped: no open connections', 'warning');
+      return;
+    }
+    setOutbox(prev => {
+      const now = new Date().toISOString();
+      const remaining = [];
+      let sentTotal = 0;
+      let attempted = 0;
+      for (const entry of prev) {
+        attempted += 1;
+        const sent = sendToOpenConnections(entry.payload);
+        if (sent > 0) {
+          sentTotal += 1;
+          continue;
+        }
+        remaining.push({
+          ...entry,
+          attempts: (entry.attempts || 0) + 1,
+          lastAttempt: now
+        });
+      }
+      if (sentTotal > 0) {
+        logSync(`Outbox delivered ${sentTotal}/${attempted} queued items (${reason})`, 'success');
+      }
+      return remaining;
+    });
+  }, [logSync, sendToOpenConnections]);
+
   const bumpLamport = useCallback((remoteClock = 0) => {
     lamportRef.current = Math.max(lamportRef.current, remoteClock || 0) + 1;
     return lamportRef.current;
@@ -780,6 +1000,8 @@ function App() {
 
   const shouldAllowInbound = useCallback((peerIdToCheck) => {
     const muted = settings.security?.mutedPeers || [];
+    const quarantined = settings.security?.quarantinedPeers || [];
+    if (quarantined.includes(peerIdToCheck)) return false;
     if (muted.includes(peerIdToCheck)) return false;
     const rate = settings.security?.rateLimit || { windowMs: 10000, maxMessages: 40, banMs: 60000 };
     const now = Date.now();
@@ -790,13 +1012,14 @@ function App() {
       entry.count = 0;
     }
     entry.count += 1;
-    if (entry.count > rate.maxMessages) {
-      entry.bannedUntil = now + rate.banMs;
-      peerRateRef.current.set(peerIdToCheck, entry);
-      logSync(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning');
-      logAudit(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning', peerIdToCheck);
-      return false;
-    }
+      if (entry.count > rate.maxMessages) {
+        entry.bannedUntil = now + rate.banMs;
+        peerRateRef.current.set(peerIdToCheck, entry);
+        logSync(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning');
+        logAudit(`Soft-ban ${peerIdToCheck} for ${Math.floor(rate.banMs / 1000)}s`, 'warning', peerIdToCheck);
+        adjustReputation(peerIdToCheck, null, -5, 'rate-limit');
+        return false;
+      }
     peerRateRef.current.set(peerIdToCheck, entry);
     return true;
   }, [logAudit, logSync, settings.security]);
@@ -805,6 +1028,91 @@ function App() {
     const trusted = settings.security?.trustedElevated || [];
     return trusted.includes(fingerprint);
   }, [settings.security]);
+
+  const getReputationKey = useCallback((peerId, fingerprint) => {
+    return fingerprint || peerId || null;
+  }, []);
+
+  const adjustReputation = useCallback((peerId, fingerprint, delta, reason) => {
+    const key = getReputationKey(peerId, fingerprint);
+    if (!key) return;
+    setPeerReputation(prev => {
+      const current = prev[key] || { score: 50, lastTs: null };
+      const nextScore = Math.max(0, Math.min(100, (current.score || 50) + delta));
+      return { ...prev, [key]: { score: nextScore, lastTs: new Date().toISOString() } };
+    });
+    if (reason) {
+      logAudit(`Reputation ${delta > 0 ? 'increased' : 'decreased'} (${reason})`, delta > 0 ? 'info' : 'warning', peerId || null, { actorFingerprint: fingerprint || null, eventType: 'ReputationUpdate' });
+    }
+  }, [getReputationKey, logAudit]);
+
+  const addQuarantine = useCallback((peerIdToQuarantine) => {
+    if (!peerIdToQuarantine) return;
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        quarantinedPeers: Array.from(new Set([peerIdToQuarantine, ...(s.security?.quarantinedPeers || [])]))
+      }
+    }));
+    logAudit('Peer quarantined locally', 'warning', peerIdToQuarantine);
+  }, [logAudit, setSettings]);
+
+  const removeQuarantine = useCallback((peerIdToRelease) => {
+    if (!peerIdToRelease) return;
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        quarantinedPeers: (s.security?.quarantinedPeers || []).filter(p => p !== peerIdToRelease)
+      }
+    }));
+    logAudit('Peer quarantine removed', 'info', peerIdToRelease);
+  }, [logAudit, setSettings]);
+
+  const recordVote = useCallback((payload) => {
+    if (!payload?.targetPeerId || !payload?.voterFingerprint) return;
+    const threshold = settings.security?.voteThreshold ?? 2;
+    const repKey = getReputationKey(payload.voterPeerId, payload.voterFingerprint);
+    const repScore = repKey ? (peerReputation?.[repKey]?.score ?? 50) : 50;
+    const weight = repScore >= 80 ? 2 : repScore <= 20 ? 0.5 : 1;
+    setPeerVotes(prev => {
+      const current = prev[payload.targetPeerId] || { voters: [], count: 0, weight: 0, lastTs: null };
+      if (current.voters.includes(payload.voterFingerprint)) return prev;
+      const updated = {
+        voters: [...current.voters, payload.voterFingerprint],
+        count: current.count + 1,
+        weight: (current.weight || 0) + weight,
+        lastTs: payload.ts || new Date().toISOString()
+      };
+      const next = { ...prev, [payload.targetPeerId]: updated };
+      if (updated.weight >= threshold) {
+        addQuarantine(payload.targetPeerId);
+        logAudit(`Peer auto-quarantined by votes (weight ${updated.weight}/${threshold})`, 'warning', payload.targetPeerId, { eventType: 'PeerVoteMuted' });
+      }
+      return next;
+    });
+    logAudit(`Peer vote recorded for ${payload.targetPeerId}`, 'info', payload.targetPeerId, { eventType: 'PeerVoteMuted', actorFingerprint: payload.voterFingerprint });
+  }, [addQuarantine, getReputationKey, logAudit, peerReputation, settings.security]);
+
+  const castVoteMute = useCallback(async (targetPeerId) => {
+    if (!identity?.privateKeyJwk || !identity?.publicKeyFingerprint) return;
+    if (!targetPeerId) return;
+    const payload = {
+      type: 'PeerVoteMuted',
+      targetPeerId,
+      voterPeerId: identity.peerId,
+      voterFingerprint: identity.publicKeyFingerprint,
+      voterPublicKeyJwk: identity.publicKeyJwk,
+      ts: new Date().toISOString()
+    };
+    const sig = await signPayload(identity.privateKeyJwk, payload);
+    const envelope = { type: 'peer_vote', payload, sig };
+    recordVote(payload);
+    const sent = sendToOpenConnections(envelope);
+    if (!sent) enqueueOutbound(envelope, 'offline');
+    logAudit(`Voted to mute ${targetPeerId}`, 'info', targetPeerId, { eventType: 'PeerVoteMuted' });
+  }, [enqueueOutbound, identity, recordVote, sendToOpenConnections]);
 
   const upsertKnownPeer = useCallback((peerInfo) => {
     if (!peerInfo?.publicKeyFingerprint) return;
@@ -849,15 +1157,6 @@ function App() {
     }));
     setConnections(list);
     setNetworkStatus(list.length > 0 ? 'connected' : 'idle');
-  }, []);
-
-  const broadcast = useCallback((payload) => {
-    if (suppressBroadcastRef.current) return;
-    connsRef.current.forEach(conn => {
-      if (conn.open) {
-        try { conn.send(payload); } catch (e) {}
-      }
-    });
   }, []);
 
   const sendSnapshot = useCallback(async (conn) => {
@@ -939,38 +1238,44 @@ function App() {
     if (!verified) {
       logSync(`Invalid snapshot signature from ${peerIdToCheck}`, 'warning');
       logAudit(`Invalid snapshot signature`, 'warning', peerIdToCheck, { signerFingerprint });
+      adjustReputation(peerIdToCheck, signerFingerprint, -10, 'invalid snapshot signature');
       return;
     }
     const signerOk = await verifySnapshotSigner(data, peerIdToCheck);
     if (!signerOk) {
       logSync(`Snapshot signer mismatch from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot signer mismatch`, 'warning', peerIdToCheck, { signerFingerprint });
+      adjustReputation(peerIdToCheck, signerFingerprint, -8, 'snapshot signer mismatch');
       return;
     }
     const eventLog = await computeEventLogHash(data.snapshot?.events || []);
     if (!eventLog.ok) {
       logSync(`Snapshot event chain invalid from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot event chain invalid`, 'warning', peerIdToCheck, { signerFingerprint });
+      adjustReputation(peerIdToCheck, signerFingerprint, -6, 'snapshot chain invalid');
       return;
     }
     const maxSeq = (data.snapshot?.events || []).reduce((m, e) => Math.max(m, e.seq || 0), 0);
     if (data.snapshot?.meta?.eventSeq && maxSeq > data.snapshot.meta.eventSeq) {
       logSync(`Snapshot event sequence invalid from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot event sequence invalid`, 'warning', peerIdToCheck, { signerFingerprint });
+      adjustReputation(peerIdToCheck, signerFingerprint, -4, 'snapshot seq invalid');
       return;
     }
     const declaredHash = data.snapshot?.meta?.eventLogHash;
     if (declaredHash && declaredHash !== eventLog.hash) {
       logSync(`Snapshot event log hash mismatch from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot event log hash mismatch`, 'warning', peerIdToCheck, { signerFingerprint });
+      adjustReputation(peerIdToCheck, signerFingerprint, -4, 'snapshot hash mismatch');
       return;
     }
     if (!declaredHash) {
       logSync(`Snapshot missing event log hash from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot missing event log hash`, 'info', peerIdToCheck, { signerFingerprint });
     }
+    adjustReputation(peerIdToCheck, signerFingerprint, 2, 'snapshot verified');
     applySnapshot(data.snapshot);
-  }, [applySnapshot, computeEventLogHash, logAudit, logSync, shouldAllowInbound, verifySignedSnapshot, verifySnapshotSigner]);
+  }, [adjustReputation, applySnapshot, computeEventLogHash, logAudit, logSync, shouldAllowInbound, verifySignedSnapshot, verifySnapshotSigner]);
 
   const isAuthorizedEvent = useCallback((evt, incomingTicket, existingTicket) => {
     if (!evt) return false;
@@ -1051,6 +1356,7 @@ function App() {
     if (!verified) {
       logSync(`Invalid signature from ${peerIdToCheck}`, 'warning');
       logAudit(`Invalid event signature (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
+      adjustReputation(peerIdToCheck, evt.actorFingerprint, -8, 'invalid event signature');
       return;
     }
     if (payload.ticket && evt.ticketHash) {
@@ -1058,6 +1364,7 @@ function App() {
       if (computed !== evt.ticketHash) {
         logSync(`Ticket hash mismatch from ${peerIdToCheck}`, 'warning');
         logAudit(`Ticket hash mismatch (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
+        adjustReputation(peerIdToCheck, evt.actorFingerprint, -5, 'ticket hash mismatch');
         return;
       }
     }
@@ -1067,6 +1374,7 @@ function App() {
       if (expected !== evt.chainHash) {
         logSync(`Event chain hash invalid from ${peerIdToCheck}`, 'warning');
         logAudit(`Event chain hash invalid (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
+        adjustReputation(peerIdToCheck, evt.actorFingerprint, -5, 'event chain invalid');
         return;
       }
       const hasPrev = stateRef.current.events.some(e => e.chainHash === prevHash);
@@ -1086,18 +1394,22 @@ function App() {
     if (!isAuthorizedEvent(evt, payload.ticket, existingTicket)) {
       logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
       logAudit(`Unauthorized event blocked (${evtLabel})`, 'warning', peerIdToCheck, evtMeta);
+      adjustReputation(peerIdToCheck, evt.actorFingerprint, -6, 'unauthorized event');
       return;
     }
+    adjustReputation(peerIdToCheck, evt.actorFingerprint, 1, 'event verified');
     applyEvent(evt, payload.ticket);
-  }, [applyEvent, getEventChainPayload, isAuthorizedEvent, logAudit, logSync, shouldAllowInbound, upsertKnownPeer, verifySignedEvent]);
+  }, [adjustReputation, applyEvent, getEventChainPayload, isAuthorizedEvent, logAudit, logSync, shouldAllowInbound, upsertKnownPeer, verifySignedEvent]);
 
   const emitEvent = useCallback(async (event, ticket) => {
     if (!event) return;
     seenEventsRef.current.add(event.id);
-    broadcast({ type: 'event', event, ticket });
+    const payload = { type: 'event', event, ticket };
+    const sent = sendToOpenConnections(payload);
+    if (sent === 0) enqueueOutbound(payload, 'offline');
     // Fallback to full snapshot to keep peers consistent if an event is dropped.
     sendSnapshotToAll();
-  }, [broadcast, sendSnapshotToAll]);
+  }, [enqueueOutbound, sendSnapshotToAll, sendToOpenConnections]);
 
   const setupConnection = useCallback((conn) => {
     connsRef.current.set(conn.peer, conn);
@@ -1109,6 +1421,7 @@ function App() {
       logSync(`Connection open with ${conn.peer}`);
       void sendHello(conn);
       void sendSnapshot(conn);
+      setTimeout(() => flushOutbox('connect'), 150);
     };
     conn.on('open', handleOpen);
     conn.on('data', (data) => {
@@ -1147,6 +1460,24 @@ function App() {
         })();
         setGossipRound(prev => prev + 1);
       }
+      if (data.type === 'peer_vote') {
+        void (async () => {
+          const payload = data.payload;
+          if (!payload?.voterFingerprint || !payload?.targetPeerId) return;
+          const verified = await verifyPayload(payload?.voterPublicKeyJwk, payload, data.sig);
+          if (!verified) {
+            logAudit('Invalid peer vote signature', 'warning', conn.peer, { eventType: 'PeerVoteMuted' });
+            return;
+          }
+          const computed = await fingerprintFromPublicJwk(payload.voterPublicKeyJwk);
+          if (!computed || computed !== payload.voterFingerprint) {
+            logAudit('Peer vote fingerprint mismatch', 'warning', conn.peer, { eventType: 'PeerVoteMuted' });
+            return;
+          }
+          recordVote(payload);
+          logSync(`Peer vote received for ${payload.targetPeerId}`);
+        })();
+      }
       if (data.type === 'event') {
         void (async () => {
           await handleIncomingEvent(data, conn.peer);
@@ -1173,11 +1504,17 @@ function App() {
       } catch (e) {}
     }
     if (conn.open) handleOpen();
-  }, [handleIncomingEvent, handleIncomingSnapshot, logSync, sendHello, sendSnapshot, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
+  }, [flushOutbox, handleIncomingEvent, handleIncomingSnapshot, logSync, sendHello, sendSnapshot, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
 
   useEffect(() => { setupConnectionRef.current = setupConnection; }, [setupConnection]);
   useEffect(() => { logSyncRef.current = logSync; }, [logSync]);
   useEffect(() => { updateConnectionsStateRef.current = updateConnectionsState; }, [updateConnectionsState]);
+  useEffect(() => {
+    if (!outbox.length) return;
+    if (!connections.some(c => c.open)) return;
+    const timer = setTimeout(() => flushOutbox('auto'), 800);
+    return () => clearTimeout(timer);
+  }, [connections, flushOutbox, outbox.length]);
 
   const connectToPeer = useCallback(() => {
     if (!peerRef.current || !connectTarget.trim()) return;
@@ -1329,6 +1666,29 @@ function App() {
   }, [identity?.peerId, settings?.peerServer, settings?.turn, peerRestartNonce]);
 
   const isCustomer = identity?.role === 'Customer';
+  const slaConfig = settings?.sla || {};
+  const getSlaTargetMins = useCallback((priority) => {
+    const map = slaConfig.targetsMins || {};
+    return map[priority] || map.Medium || 240;
+  }, [slaConfig.targetsMins]);
+  const buildSlaForTicket = useCallback((startIso, priority) => {
+    const dueAt = addMinutes(startIso, getSlaTargetMins(priority));
+    return {
+      startedAt: startIso,
+      dueAt,
+      breachedAt: null,
+      supervisorAlertAt: null,
+      resolvedAt: null,
+      closedAt: null,
+      lastAutoEscalatedAt: null
+    };
+  }, [getSlaTargetMins]);
+  const getNextEscalationLevel = useCallback((level) => {
+    if (level === 'L1') return 'L2';
+    if (level === 'L2') return 'Senior';
+    if (level === 'Senior') return 'Supervisor';
+    return 'Supervisor';
+  }, []);
 
   const handleCreateTicket = async (ticket) => {
     const now = new Date().toISOString();
@@ -1350,11 +1710,18 @@ function App() {
       messages: [{ id: genId(), type: 'customer', sender: customerName, text: ticket.message, ts: now }],
       created: now,
       updated: now,
+      sla: buildSlaForTicket(now, ticket.priority),
       clock,
       updatedByFingerprint: identity?.publicKeyFingerprint || null,
       updatedByPeerId: identity?.peerId || null,
       replicationCount: 1,
-      tags: []
+      tags: [],
+      acl: {
+        mode: 'public',
+        roles: ['Customer', 'L1', 'L2', 'Senior', 'Supervisor'],
+        peers: [isCustomer ? identity.peerId : null].filter(Boolean),
+        fingerprints: []
+      }
     };
     const ticketHash = await hashPayload(newTicket);
     const evtBase = { id: genId(), type: 'TicketCreated', ticketId: newTicket.id, actor: customerName, ts: now, detail: ticket.subject, clock, seq, ticketHash };
@@ -1499,6 +1866,10 @@ function App() {
       ...base,
       status: 'Resolved',
       updated: now,
+      sla: {
+        ...(base.sla || buildSlaForTicket(base.created, base.priority)),
+        resolvedAt: now
+      },
       clock,
       updatedByFingerprint: identity?.publicKeyFingerprint || null,
       updatedByPeerId: identity?.peerId || null
@@ -1534,6 +1905,10 @@ function App() {
       ...base,
       status: 'Closed',
       updated: now,
+      sla: {
+        ...(base.sla || buildSlaForTicket(base.created, base.priority)),
+        closedAt: now
+      },
       clock,
       updatedByFingerprint: identity.publicKeyFingerprint,
       updatedByPeerId: identity.peerId
@@ -1565,6 +1940,7 @@ function App() {
       ...base,
       status: 'Open',
       updated: now,
+      sla: buildSlaForTicket(now, base.priority),
       clock,
       updatedByFingerprint: identity.publicKeyFingerprint,
       updatedByPeerId: identity.peerId
@@ -1581,6 +1957,126 @@ function App() {
     }));
     await emitEvent(evt, updatedTicket);
   };
+
+  const applyAutomatedTicketUpdate = useCallback(async (base, changes, eventType, detail) => {
+    if (!base) return null;
+    if (!identity?.privateKeyJwk) return null;
+    const now = new Date().toISOString();
+    const clock = bumpLamport();
+    const seq = bumpEventSeq();
+    const updatedTicket = {
+      ...base,
+      ...changes,
+      updated: now,
+      clock,
+      updatedByFingerprint: identity?.publicKeyFingerprint || base.updatedByFingerprint || null,
+      updatedByPeerId: identity?.peerId || base.updatedByPeerId || null
+    };
+    const ticketHash = await hashPayload(updatedTicket);
+    const evtBase = { id: genId(), type: eventType, ticketId: base.id, actor: identity?.displayName || 'System', ts: now, detail, clock, seq, ticketHash };
+    const evt = await createSignedEvent(evtBase);
+    if (!evt) return null;
+    setState(prev => ({
+      ...prev,
+      tickets: prev.tickets.map(t => t.id === base.id ? updatedTicket : t),
+      events: [evt, ...prev.events],
+      meta: { ...prev.meta, lamport: clock, eventSeq: seq }
+    }));
+    await emitEvent(evt, updatedTicket);
+    return updatedTicket;
+  }, [bumpEventSeq, bumpLamport, createSignedEvent, emitEvent, identity]);
+
+  useEffect(() => {
+    if (!slaConfig?.enabled) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        if (!identity?.privateKeyJwk) return;
+        const tickets = stateRef.current.tickets || [];
+        const nowIso = new Date().toISOString();
+        for (const baseTicket of tickets) {
+          if (!baseTicket) continue;
+          if (['Resolved', 'Closed'].includes(baseTicket.status)) continue;
+          let working = baseTicket;
+          let sla = working.sla || buildSlaForTicket(working.created, working.priority);
+
+          // Auto-escalate Critical immediately
+          if (slaConfig.autoEscalateCritical && working.priority === 'Critical' && working.escalationLevel === 'L1' && working.status !== 'Escalated') {
+            if (!identity?.publicKeyFingerprint || !isTrustedElevated(identity.publicKeyFingerprint)) {
+              logAudit('Auto-escalation blocked (not trusted)', 'warning', identity?.peerId || null, { ticketId: working.id, eventType: 'TicketEscalated' });
+            } else {
+              const next = getNextEscalationLevel(working.escalationLevel);
+              const updated = await applyAutomatedTicketUpdate(
+                working,
+                {
+                  status: 'Escalated',
+                  escalationLevel: next,
+                  sla: { ...sla, lastAutoEscalatedAt: nowIso }
+                },
+                'TicketEscalated',
+                'Auto-escalated: Critical priority'
+              );
+              if (updated) {
+                working = updated;
+                sla = updated.sla || sla;
+              }
+            }
+          }
+
+          // Auto-escalate if unassigned too long
+          if (slaConfig.autoEscalateAfterMins > 0 && !working.agentId && minutesSince(working.created) >= slaConfig.autoEscalateAfterMins && working.status !== 'Escalated') {
+            if (!identity?.publicKeyFingerprint || !isTrustedElevated(identity.publicKeyFingerprint)) {
+              logAudit('Auto-escalation blocked (not trusted)', 'warning', identity?.peerId || null, { ticketId: working.id, eventType: 'TicketEscalated' });
+            } else {
+              const next = getNextEscalationLevel(working.escalationLevel);
+              const updated = await applyAutomatedTicketUpdate(
+                working,
+                {
+                  status: 'Escalated',
+                  escalationLevel: next,
+                  sla: { ...sla, lastAutoEscalatedAt: nowIso }
+                },
+                'TicketEscalated',
+                `Auto-escalated: Unassigned for ${slaConfig.autoEscalateAfterMins}m`
+              );
+              if (updated) {
+                working = updated;
+                sla = updated.sla || sla;
+              }
+            }
+          }
+
+          // SLA breach
+          if (!sla.breachedAt && sla.dueAt && new Date(nowIso).getTime() >= new Date(sla.dueAt).getTime()) {
+            const updated = await applyAutomatedTicketUpdate(
+              working,
+              { sla: { ...sla, breachedAt: nowIso } },
+              'SlaBreached',
+              `SLA breached (due ${new Date(sla.dueAt).toLocaleString()})`
+            );
+            if (updated) {
+              working = updated;
+              sla = updated.sla || sla;
+            }
+          }
+
+          // Supervisor alert
+          if (slaConfig.supervisorAlertAfterMins > 0 && !sla.supervisorAlertAt && minutesSince(working.created) >= slaConfig.supervisorAlertAfterMins) {
+            const updated = await applyAutomatedTicketUpdate(
+              working,
+              { sla: { ...sla, supervisorAlertAt: nowIso } },
+              'SupervisorAlerted',
+              `Supervisor alert after ${slaConfig.supervisorAlertAfterMins}m unresolved`
+            );
+            if (updated) {
+              working = updated;
+              sla = updated.sla || sla;
+            }
+          }
+        }
+      })();
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [applyAutomatedTicketUpdate, buildSlaForTicket, getNextEscalationLevel, identity?.peerId, identity?.privateKeyJwk, identity?.publicKeyFingerprint, logAudit, slaConfig]);
 
   const handleSendMessage = async (ticketId, text) => {
     if (!text.trim()) return;
@@ -1651,13 +2147,23 @@ function App() {
     return list;
   }, [connections, identity, knownPeersById]);
 
+  const canViewTicket = useCallback((ticket, viewer) => {
+    if (!ticket || !viewer) return true;
+    const acl = ticket.acl;
+    if (!acl || acl.mode !== 'restricted') return true;
+    if (acl.peers?.includes(viewer.peerId)) return true;
+    if (acl.fingerprints?.includes(viewer.publicKeyFingerprint)) return true;
+    if (acl.roles?.includes(viewer.role)) return true;
+    return false;
+  }, []);
+
   const visibleTickets = useMemo(() => {
     if (!identity) return state.tickets;
     if (identity.role === 'Customer') {
-      return state.tickets.filter(t => t.customerPeerId === identity.peerId);
+      return state.tickets.filter(t => t.customerPeerId === identity.peerId).filter(t => canViewTicket(t, identity));
     }
-    return state.tickets;
-  }, [identity, state.tickets]);
+    return state.tickets.filter(t => canViewTicket(t, identity));
+  }, [canViewTicket, identity, state.tickets]);
 
   const metrics = useMemo(() => {
     const openTickets = visibleTickets.filter(t => ['Open', 'In Progress', 'Waiting', 'Escalated'].includes(t.status)).length;
@@ -1800,13 +2306,25 @@ function App() {
           }),
           view === 'chat' && h(ChatView, { tickets: visibleTickets, isDark, identity, onSendMessage: handleSendMessage, selectedTicketId, setSelectedTicketId }),
           view === 'agents' && h(AgentsView, { agents: agentsList, tickets: state.tickets, isDark, identity, onStartChat: handleStartAgentChat }),
-          view === 'escalations' && h(EscalationsView, { state, isDark, onClaim: handleClaimTicket, identity }),
+          view === 'escalations' && h(EscalationsView, { state, isDark, onClaim: handleClaimTicket, identity, slaConfig: settings.sla }),
           view === 'network' && h(NetworkView, {
             state, isDark, gossipRound, syncLog, identity,
             peerStatus, peerId, connections, connectTarget, setConnectTarget,
             onConnectPeer: connectToPeer, onDisconnectPeer: disconnectPeer, onSyncNow: sendSnapshotToAll,
             onRequestSnapshot: requestSnapshotFromPeer, onPingPeer: pingPeer, onReconnectPeerJS: reconnectPeerJS,
-            knownPeersById
+            knownPeersById,
+            outbox,
+            onFlushOutbox: flushOutbox,
+            onClearOutbox: () => {
+              setOutbox([]);
+              logSync('Outbox cleared', 'warning');
+            },
+            peerVotes,
+            onVoteMute: castVoteMute,
+            mutedPeers: settings.security?.mutedPeers || [],
+            quarantinedPeers: settings.security?.quarantinedPeers || [],
+            onQuarantine: addQuarantine,
+            onReleaseQuarantine: removeQuarantine
           }),
           view === 'audit' && h(AuditView, {
             auditLog,
@@ -2039,7 +2557,8 @@ function DashboardView({ state, metrics, agents, isDark }) {
               const evtColors = {
                 'TicketCreated': 'text-blue-400', 'TicketAssigned': 'text-indigo-400', 'TicketEscalated': 'text-red-400',
                 'TicketResolved': 'text-emerald-400', 'TicketClosed': 'text-slate-400', 'TicketReopened': 'text-amber-400',
-                'MessageSent': 'text-slate-400', 'AgentStatus': 'text-amber-400'
+                'MessageSent': 'text-slate-400', 'AgentStatus': 'text-amber-400',
+                'SlaBreached': 'text-red-400', 'SupervisorAlerted': 'text-amber-400'
               };
             if (entry.kind === 'message-group') {
               const isExpanded = !!expandedGroups[entry.id];
@@ -2463,15 +2982,15 @@ function AgentsView({ agents, tickets, isDark, identity, onStartChat }) {
 }
 
 // ============ ESCALATIONS VIEW ============
-function EscalationsView({ state, isDark, onClaim, identity }) {
+function EscalationsView({ state, isDark, onClaim, identity, slaConfig }) {
   const escalated = state.tickets.filter(t => t.status === 'Escalated');
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
 
   const rules = [
-    { text: 'Auto-escalate after 10 minutes unassigned', enabled: true },
-    { text: 'Escalate Critical tickets to L2 immediately', enabled: true },
-    { text: 'Alert Supervisor if ticket unresolved after 30 minutes', enabled: false },
-    { text: 'Notify all agents on Critical escalation', enabled: true },
+    { text: `Auto-escalate after ${slaConfig?.autoEscalateAfterMins || 0} minutes unassigned`, enabled: !!slaConfig?.enabled && (slaConfig?.autoEscalateAfterMins || 0) > 0 },
+    { text: 'Escalate Critical tickets to L2 immediately', enabled: !!slaConfig?.enabled && !!slaConfig?.autoEscalateCritical },
+    { text: `Alert Supervisor if ticket unresolved after ${slaConfig?.supervisorAlertAfterMins || 0} minutes`, enabled: !!slaConfig?.enabled && (slaConfig?.supervisorAlertAfterMins || 0) > 0 },
+    { text: 'Track SLA due times by priority', enabled: !!slaConfig?.enabled }
   ];
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6' },
@@ -2538,7 +3057,7 @@ function EscalationsView({ state, isDark, onClaim, identity }) {
 }
 
 // ============ NETWORK VIEW ============
-function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS, knownPeersById }) {
+function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS, knownPeersById, outbox, onFlushOutbox, onClearOutbox, peerVotes, onVoteMute, mutedPeers, quarantinedPeers, onQuarantine, onReleaseQuarantine }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const nodesRef = useRef([]);
@@ -2749,6 +3268,23 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
     { label: 'Replication Factor', value: connections.length ? (1 + connections.length).toFixed(1) + 'x' : '1.0x' },
     { label: 'Gossip Round', value: gossipRound },
   ];
+  const outboxStats = useMemo(() => {
+    const count = outbox?.length || 0;
+    if (!count) return { count: 0, lastAttempt: null, oldest: null };
+    let oldest = null;
+    let lastAttempt = null;
+    outbox.forEach(e => {
+      const created = e.createdAt ? new Date(e.createdAt).getTime() : null;
+      const attempt = e.lastAttempt ? new Date(e.lastAttempt).getTime() : null;
+      if (created && (!oldest || created < oldest)) oldest = created;
+      if (attempt && (!lastAttempt || attempt > lastAttempt)) lastAttempt = attempt;
+    });
+    return {
+      count,
+      oldest: oldest ? new Date(oldest).toISOString() : null,
+      lastAttempt: lastAttempt ? new Date(lastAttempt).toISOString() : null
+    };
+  }, [outbox]);
 
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6' },
     // Peer controls
@@ -2801,6 +3337,9 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
             const known = knownPeersById?.get(c.peerId);
             const displayName = known?.displayName || `Peer ${i + 1}`;
             const role = known?.role || 'L1';
+            const voteCount = peerVotes?.[c.peerId]?.count || 0;
+            const isMuted = mutedPeers?.includes(c.peerId);
+            const isQuarantined = quarantinedPeers?.includes(c.peerId);
             return h('div', {
               key: c.peerId,
               className: `flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`
@@ -2812,8 +3351,9 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
                   h('div', { className: `text-[11px] ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, role)
                 )
               ),
-              h('div', { className: 'flex items-center gap-2' },
+              h('div', { className: 'flex items-center gap-2 flex-wrap' },
                 h('span', { className: `text-[11px] px-2 py-0.5 rounded-full border ${c.open ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' : 'text-slate-400 border-slate-500/30 bg-slate-500/10'}` }, c.open ? 'online' : 'offline'),
+                voteCount > 0 && h('span', { className: 'text-[11px] px-2 py-0.5 rounded-full border border-amber-500/30 text-amber-400 bg-amber-500/10' }, `votes ${voteCount}`),
                 h('button', {
                   onClick: () => onPingPeer(c.peerId),
                   className: 'text-[11px] px-2 py-1 rounded-md bg-slate-500/10 text-slate-400 hover:bg-slate-500/20'
@@ -2823,12 +3363,55 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
                   className: 'text-[11px] px-2 py-1 rounded-md bg-brand-500/10 text-brand-400 hover:bg-brand-500/20'
                 }, 'Request Sync'),
                 h('button', {
+                  onClick: () => onVoteMute?.(c.peerId),
+                  className: 'text-[11px] px-2 py-1 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+                }, 'Vote Mute'),
+                !isQuarantined && h('button', {
+                  onClick: () => onQuarantine?.(c.peerId),
+                  className: 'text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20'
+                }, 'Quarantine'),
+                isQuarantined && h('button', {
+                  onClick: () => onReleaseQuarantine?.(c.peerId),
+                  className: 'text-[11px] px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                }, 'Release'),
+                h('button', {
                   onClick: () => onDisconnectPeer(c.peerId),
                   className: 'text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20'
                 }, 'Disconnect')
               )
             );
           })
+        )
+      )
+    ),
+    // Outbox
+    h('div', { className: `rounded-xl border ${bg} p-5` },
+      h('div', { className: 'flex items-start justify-between gap-4' },
+        h('div', null,
+          h('div', { className: 'text-sm font-medium mb-1' }, 'Offline Outbox'),
+          h('div', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}` },
+            outboxStats.count
+              ? `Queued items: ${outboxStats.count}`
+              : 'No queued items. Events will queue while offline.'
+          ),
+          outboxStats.oldest && h('div', { className: `text-[11px] mt-2 ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
+            'Oldest queued: ', new Date(outboxStats.oldest).toLocaleString()
+          ),
+          outboxStats.lastAttempt && h('div', { className: `text-[11px] ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
+            'Last attempt: ', new Date(outboxStats.lastAttempt).toLocaleString()
+          )
+        ),
+        h('div', { className: 'flex items-center gap-2' },
+          h('button', {
+            onClick: () => onFlushOutbox?.('manual'),
+            disabled: !outboxStats.count,
+            className: `px-3 py-2 text-xs rounded-lg border ${outboxStats.count ? (isDark ? 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50') : (isDark ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed' : 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed')}`
+          }, 'Flush Outbox'),
+          h('button', {
+            onClick: () => onClearOutbox?.(),
+            disabled: !outboxStats.count,
+            className: `px-3 py-2 text-xs rounded-lg border ${outboxStats.count ? (isDark ? 'border-red-500/40 text-red-400 hover:bg-red-500/10' : 'border-red-200 text-red-500 hover:bg-red-50') : (isDark ? 'border-slate-800 text-slate-600 cursor-not-allowed' : 'border-slate-200 text-slate-400 cursor-not-allowed')}`
+          }, 'Clear')
         )
       )
     ),
@@ -3008,6 +3591,11 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
   const [trustInput, setTrustInput] = useState('');
   const [importText, setImportText] = useState('');
   const [importStatus, setImportStatus] = useState(null);
+  const [recoveryPhrase, setRecoveryPhrase] = useState('');
+  const [recoveryConfirm, setRecoveryConfirm] = useState('');
+  const [recoveryBundleText, setRecoveryBundleText] = useState('');
+  const [recoveryStatus, setRecoveryStatus] = useState(null);
+  const [rotationStatus, setRotationStatus] = useState(null);
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
 
   const handleSave = () => {
@@ -3084,6 +3672,108 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
     }
   };
 
+  const handleGenerateRecovery = async () => {
+    const phrase = await generateRecoveryPhrase();
+    setRecoveryPhrase(phrase);
+    setRecoveryConfirm('');
+    setRecoveryStatus({ type: 'info', msg: 'Recovery phrase generated. Store it offline.' });
+    if (navigator?.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(phrase); } catch (e) {}
+    }
+  };
+
+  const handleExportRecoveryBundle = async () => {
+    try {
+      if (!identity?.publicKeyJwk || !identity?.privateKeyJwk) throw new Error('missing');
+      if (!recoveryPhrase) throw new Error('phrase');
+      const verified = await verifyRecoveryPhrase(recoveryPhrase);
+      if (!verified) throw new Error('invalid');
+      if (recoveryConfirm && parseRecoveryPhrase(recoveryConfirm) !== parseRecoveryPhrase(recoveryPhrase)) throw new Error('confirm');
+      const bundle = await encryptIdentityBundle(identity, recoveryPhrase);
+      downloadJson(`meshdesk-recovery-${identity.peerId || 'bundle'}.json`, bundle);
+      setRecoveryStatus({ type: 'success', msg: 'Encrypted recovery bundle exported.' });
+    } catch (e) {
+      setRecoveryStatus({ type: 'error', msg: 'Failed to export recovery bundle.' });
+    }
+  };
+
+  const handleImportRecoveryBundle = async () => {
+    try {
+      const parsed = JSON.parse(recoveryBundleText || '');
+      if (!parsed?.ciphertext || !parsed?.salt || !parsed?.iv) throw new Error('format');
+      const phraseOk = await verifyRecoveryPhrase(recoveryPhrase);
+      if (!phraseOk) throw new Error('phrase');
+      const recovered = await decryptIdentityBundle(parsed, recoveryPhrase);
+      const computed = await fingerprintFromPublicJwk(recovered.publicKeyJwk);
+      if (!computed) throw new Error('fingerprint');
+      const peerId = recovered.peerId || ('peer-' + computed.replace(/:/g, '').slice(0, 12));
+      const updated = {
+        ...recovered,
+        publicKeyFingerprint: computed,
+        peerId,
+        displayName: recovered.displayName || editName || 'Anonymous',
+        role: recovered.role || editRole || 'L1'
+      };
+      setIdentity(updated);
+      saveIdentity(updated);
+      setPeerId(updated.peerId);
+      setRecoveryStatus({ type: 'success', msg: 'Recovery bundle imported.' });
+    } catch (e) {
+      setRecoveryStatus({ type: 'error', msg: 'Recovery import failed.' });
+    }
+  };
+
+  const handleRotateKeys = async () => {
+    try {
+      if (!identity?.privateKeyJwk || !identity?.publicKeyJwk) throw new Error('missing');
+      const keys = await generateIdentityKeys();
+      const rotationPayload = {
+        oldFingerprint: identity.publicKeyFingerprint,
+        newFingerprint: keys.fingerprint,
+        newPublicKeyJwk: keys.publicKeyJwk,
+        ts: new Date().toISOString()
+      };
+      const rotationSig = await signPayload(identity.privateKeyJwk, rotationPayload);
+      const updated = {
+        ...identity,
+        publicKeyFingerprint: keys.fingerprint,
+        publicKeyJwk: keys.publicKeyJwk,
+        privateKeyJwk: keys.privateKeyJwk,
+        peerId: keys.peerId,
+        rotatedAt: rotationPayload.ts,
+        rotationProof: { ...rotationPayload, sig: rotationSig }
+      };
+      setIdentity(updated);
+      saveIdentity(updated);
+      setPeerId(updated.peerId);
+      setRotationStatus({ type: 'success', msg: 'Keys rotated. Share your new fingerprint.' });
+    } catch (e) {
+      setRotationStatus({ type: 'error', msg: 'Key rotation failed.' });
+    }
+  };
+
+  const updateVoteThreshold = (value) => {
+    const num = Math.max(1, Math.min(10, Number(value) || 1));
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        voteThreshold: num
+      }
+    }));
+  };
+
+  const releaseQuarantine = (peerId) => {
+    if (!peerId) return;
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        quarantinedPeers: (s.security?.quarantinedPeers || []).filter(p => p !== peerId)
+      }
+    }));
+  };
+
   return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6 max-w-2xl' },
     // Identity
     h('div', { className: `rounded-xl border ${bg} p-6` },
@@ -3133,6 +3823,60 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       importStatus && h('div', { className: `mt-3 text-xs ${importStatus.type === 'error' ? 'text-red-400' : importStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, importStatus.msg)
     ),
 
+    // Recovery phrase + rotation
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Recovery Phrase & Rotation'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
+        'Generate a recovery phrase to encrypt your identity bundle. This lets you recover without exposing your private key.'
+      ),
+      h('div', { className: 'space-y-3' },
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recovery Phrase'),
+          h('input', {
+            type: 'text',
+            value: recoveryPhrase,
+            onChange: e => setRecoveryPhrase(e.target.value),
+            placeholder: 'Generate or paste your recovery phrase',
+            className: `w-full px-3 py-2 text-xs rounded-lg border font-mono ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }),
+          h('div', { className: 'flex gap-2 mt-2' },
+            h('button', { onClick: handleGenerateRecovery, className: 'px-3 py-2 bg-brand-500 hover:bg-brand-600 text-white text-xs rounded-lg font-medium transition-colors' }, 'Generate Phrase'),
+            h('button', { onClick: handleExportRecoveryBundle, className: `px-3 py-2 text-xs rounded-lg font-medium border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Export Encrypted Bundle')
+          )
+        ),
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Confirm Phrase (optional)'),
+          h('input', {
+            type: 'text',
+            value: recoveryConfirm,
+            onChange: e => setRecoveryConfirm(e.target.value),
+            placeholder: 'Re-enter phrase to confirm',
+            className: `w-full px-3 py-2 text-xs rounded-lg border font-mono ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          })
+        ),
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Import Encrypted Recovery Bundle'),
+          h('textarea', {
+            rows: 4,
+            value: recoveryBundleText,
+            onChange: e => setRecoveryBundleText(e.target.value),
+            placeholder: 'Paste encrypted recovery JSON here',
+            className: `w-full px-3 py-2 text-xs rounded-lg border font-mono ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }),
+          h('button', { onClick: handleImportRecoveryBundle, className: 'mt-2 px-3 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-xs rounded-lg font-medium transition-colors' }, 'Import Recovery')
+        )
+      ),
+      recoveryStatus && h('div', { className: `mt-3 text-xs ${recoveryStatus.type === 'error' ? 'text-red-400' : recoveryStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, recoveryStatus.msg),
+      h('div', { className: 'mt-4 flex items-center justify-between' },
+        h('div', null,
+          h('div', { className: 'text-sm' }, 'Key Rotation'),
+          h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Generate a new keypair and create a rotation proof.')
+        ),
+        h('button', { onClick: handleRotateKeys, className: 'px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs rounded-lg font-medium transition-colors' }, 'Rotate Keys')
+      ),
+      rotationStatus && h('div', { className: `mt-2 text-xs ${rotationStatus.type === 'error' ? 'text-red-400' : rotationStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, rotationStatus.msg)
+    ),
+
     // Trust & roles
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Trust & Role Enforcement'),
@@ -3169,6 +3913,38 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
               h('button', { onClick: () => setTrustInput(p.publicKeyFingerprint), className: 'text-brand-400 hover:text-brand-300 text-xs' }, 'Use')
             )
           )
+        )
+      )
+    ),
+
+    // Governance
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Governance Controls'),
+      h('div', { className: 'space-y-4' },
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Vote Threshold (weight)'),
+          h('input', {
+            type: 'number',
+            min: 1,
+            max: 10,
+            value: settings.security?.voteThreshold ?? 2,
+            onChange: e => updateVoteThreshold(e.target.value),
+            className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }),
+          h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Higher values require more (or higher reputation) votes to quarantine.')
+        ),
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Quarantined Peers'),
+          (settings.security?.quarantinedPeers || []).length === 0 ?
+            h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No quarantined peers.') :
+            h('div', { className: 'space-y-2' },
+              (settings.security?.quarantinedPeers || []).map(pid =>
+                h('div', { key: pid, className: `flex items-center justify-between rounded-lg px-3 py-2 text-xs border ${isDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'}` },
+                  h('span', { className: 'font-mono break-all' }, pid),
+                  h('button', { onClick: () => releaseQuarantine(pid), className: 'text-emerald-400 hover:text-emerald-300 text-xs' }, 'Release')
+                )
+              )
+            )
         )
       )
     ),

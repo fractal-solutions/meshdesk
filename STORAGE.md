@@ -10,6 +10,8 @@
     - `role`
     - `status`
     - `createdAt`
+    - `rotatedAt` (optional)
+    - `rotationProof` (optional)
     - `publicKeyJwk`
     - `privateKeyJwk`
     - `publicKeyFingerprint`
@@ -35,10 +37,36 @@
     - `security`:
       - `trustedElevated`: array of fingerprints
       - `rateLimit`: `{ windowMs, maxMessages, banMs }`
+      - `quarantinedPeers`: array of peerIds
+      - `voteThreshold`: number
     - `peerServer`:
       - `useCustom`, `host`, `port`, `path`, `secure`
     - `turn`:
       - `enabled`, `host`, `port`, `username`, `credential`, `useTLS`
+    - `sla`:
+      - `enabled`
+      - `targetsMins` (per-priority SLA minutes)
+      - `autoEscalateAfterMins`
+      - `autoEscalateCritical`
+      - `supervisorAlertAfterMins`
+
+- `meshdesk_outbox`
+  - Offline outbound queue for events while disconnected.
+  - Array of entries:
+    - `id`
+    - `payload` (e.g. `{ type: "event", event, ticket }`)
+    - `reason` (`offline` | `manual` | ...)
+    - `createdAt`
+    - `attempts`
+    - `lastAttempt`
+
+- `meshdesk_peer_votes`
+  - Local tally of peer-votes to mute.
+  - `{ [peerId]: { voters: [fingerprint], count, weight, lastTs } }`
+
+- `meshdesk_peer_reputation`
+  - Local reputation scores.
+  - `{ [fingerprintOrPeerId]: { score, lastTs } }`
 
 ## Event Structure (signed + hash-chained)
 
@@ -84,7 +112,22 @@ Notes:
   "updated": "2026-03-16T...Z",
   "clock": 42,
   "updatedByFingerprint": "abcd:1234:...",
-  "updatedByPeerId": "peer-..."
+  "updatedByPeerId": "peer-...",
+  "acl": {
+    "mode": "public" | "restricted",
+    "roles": ["Customer", "L1", "L2", "Senior", "Supervisor"],
+    "peers": ["peer-..."],
+    "fingerprints": ["abcd:1234:..."]
+  },
+  "sla": {
+    "startedAt": "2026-03-16T...Z",
+    "dueAt": "2026-03-16T...Z",
+    "breachedAt": null,
+    "supervisorAlertAt": null,
+    "resolvedAt": null,
+    "closedAt": null,
+    "lastAutoEscalatedAt": null
+  }
 }
 ```
 
@@ -132,3 +175,18 @@ Notes:
 
 - All data is client-side only; PeerJS is used for signaling and WebRTC data channels.
 - Events and snapshots are verified by signature; snapshots also validate event log hash and signer fingerprint.
+
+## Recovery Bundle (Export Format)
+
+Encrypted identity export created from the recovery phrase:
+
+```
+{
+  "version": 1,
+  "kdf": "PBKDF2-SHA256",
+  "iterations": 200000,
+  "salt": "base64",
+  "iv": "base64",
+  "ciphertext": "base64(AES-GCM(identity))"
+}
+```
