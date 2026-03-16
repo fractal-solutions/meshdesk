@@ -948,6 +948,7 @@ function App() {
 
   const isAuthorizedEvent = useCallback((evt, incomingTicket, existingTicket) => {
     if (!evt) return false;
+    const isSenior = getRoleRank(evt.actorRole) >= getRoleRank('Senior');
     if (evt.type === 'TicketEscalated') return isTrustedElevated(evt.actorFingerprint);
     if (evt.type === 'TicketClosed') {
       if (existingTicket?.status === 'Resolved') {
@@ -960,6 +961,7 @@ function App() {
     }
     if (evt.type === 'TicketResolved') {
       if (incomingTicket?.agentId && incomingTicket.agentId === evt.actorPeerId) return true;
+      if (isSenior) return true;
       return isTrustedElevated(evt.actorFingerprint);
     }
     if (evt.type === 'TicketAssigned') {
@@ -1008,17 +1010,18 @@ function App() {
     if (!payload?.event) return;
     if (!shouldAllowInbound(peerIdToCheck)) return;
     const evt = payload.event;
+    const evtLabel = `${evt.type || 'Event'} id=${evt.id || 'unknown'} ticket=${evt.ticketId || 'n/a'} actor=${evt.actor || 'unknown'}`;
     const verified = await verifySignedEvent(evt);
     if (!verified) {
       logSync(`Invalid signature from ${peerIdToCheck}`, 'warning');
-      logAudit(`Invalid event signature`, 'warning', peerIdToCheck);
+      logAudit(`Invalid event signature (${evtLabel})`, 'warning', peerIdToCheck);
       return;
     }
     if (payload.ticket && evt.ticketHash) {
       const computed = await hashPayload(payload.ticket);
       if (computed !== evt.ticketHash) {
         logSync(`Ticket hash mismatch from ${peerIdToCheck}`, 'warning');
-        logAudit(`Ticket hash mismatch`, 'warning', peerIdToCheck);
+        logAudit(`Ticket hash mismatch (${evtLabel})`, 'warning', peerIdToCheck);
         return;
       }
     }
@@ -1027,13 +1030,13 @@ function App() {
       const expected = await hashPayload({ prevHash, event: getEventChainPayload(evt) });
       if (expected !== evt.chainHash) {
         logSync(`Event chain hash invalid from ${peerIdToCheck}`, 'warning');
-        logAudit(`Event chain hash invalid`, 'warning', peerIdToCheck);
+        logAudit(`Event chain hash invalid (${evtLabel})`, 'warning', peerIdToCheck);
         return;
       }
       const hasPrev = stateRef.current.events.some(e => e.chainHash === prevHash);
       if (evt.prevHash && !hasPrev) {
         logSync(`Event chain link missing from ${peerIdToCheck}`, 'warning');
-        logAudit(`Event chain link missing`, 'info', peerIdToCheck);
+        logAudit(`Event chain link missing (${evtLabel})`, 'info', peerIdToCheck);
       }
     }
     const existingTicket = payload.ticket ? stateRef.current.tickets.find(t => t.id === payload.ticket.id) : null;
@@ -1046,7 +1049,7 @@ function App() {
     });
     if (!isAuthorizedEvent(evt, payload.ticket, existingTicket)) {
       logSync(`Unauthorized event blocked from ${peerIdToCheck}`, 'warning');
-      logAudit(`Unauthorized event blocked (${evt.type})`, 'warning', peerIdToCheck);
+      logAudit(`Unauthorized event blocked (${evtLabel})`, 'warning', peerIdToCheck);
       return;
     }
     applyEvent(evt, payload.ticket);
