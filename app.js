@@ -237,6 +237,28 @@ const downloadCsv = (filename, rows) => {
     URL.revokeObjectURL(url);
   } catch (e) {}
 };
+const checkPowHash = (hash, difficulty) => {
+  if (!difficulty || difficulty <= 0) return true;
+  return hash.startsWith('0'.repeat(difficulty));
+};
+const generatePowToken = async (peerId, fingerprint, difficulty, maxAttempts = 20000) => {
+  if (!difficulty || difficulty <= 0) return null;
+  let nonce = 0;
+  for (let i = 0; i < maxAttempts; i++) {
+    nonce = Math.floor(Math.random() * 1e9);
+    const hash = await hashPayload({ nonce, peerId, fingerprint });
+    if (checkPowHash(hash, difficulty)) {
+      return { nonce, hash, difficulty, ts: new Date().toISOString() };
+    }
+  }
+  return null;
+};
+const verifyPowToken = async (token, peerId, fingerprint, difficulty) => {
+  if (!difficulty || difficulty <= 0) return true;
+  if (!token?.nonce || !token?.hash) return false;
+  const computed = await hashPayload({ nonce: token.nonce, peerId, fingerprint });
+  return computed === token.hash && checkPowHash(computed, difficulty);
+};
 
 // ============ DATA GENERATION ============
 const AGENT_NAMES = ['Alex Chen', 'Maya Johnson', 'Raj Patel', 'Sofia Martinez', 'Liam O\'Brien', 'Yuki Tanaka', 'Awa Diallo', 'Marcus Weber'];
@@ -342,7 +364,12 @@ function loadSettings() {
       mutedPeers: [],
       quarantinedPeers: [],
       voteThreshold: 2,
+      pow: { enabled: false, difficulty: 3 },
       rateLimit: { windowMs: 10000, maxMessages: 40, banMs: 60000 }
+    },
+    sync: {
+      recentMinutes: 0,
+      scope: 'all'
     },
     peerServer: {
       useCustom: false,
@@ -380,10 +407,12 @@ function loadSettings() {
           mutedPeers: parsed.security?.mutedPeers || defaults.security.mutedPeers,
           quarantinedPeers: parsed.security?.quarantinedPeers || defaults.security.quarantinedPeers,
           voteThreshold: parsed.security?.voteThreshold ?? defaults.security.voteThreshold,
+          pow: { ...defaults.security.pow, ...(parsed.security?.pow || {}) },
           rateLimit: { ...defaults.security.rateLimit, ...(parsed.security?.rateLimit || {}) }
         },
         peerServer: { ...defaults.peerServer, ...(parsed.peerServer || {}) },
         turn: { ...defaults.turn, ...(parsed.turn || {}) },
+        sync: { ...defaults.sync, ...(parsed.sync || {}) },
         sla: {
           ...defaults.sla,
           ...(parsed.sla || {}),
@@ -592,6 +621,7 @@ function App() {
   const [connections, setConnections] = useState([]);
   const [knownPeers, setKnownPeers] = useState([]);
   const [auditLog, setAuditLog] = useState([]);
+  const [pendingPolicies, setPendingPolicies] = useState([]);
   const [peerVotes, setPeerVotes] = useState(() => {
     try {
       const saved = localStorage.getItem('meshdesk_peer_votes');
@@ -919,6 +949,29 @@ function App() {
     };
   }, [identity]);
 
+  const getPolicyPayload = useCallback(() => {
+    const security = settings.security || {};
+    return {
+      policy: {
+        security: {
+          trustedElevated: security.trustedElevated || [],
+          mutedPeers: security.mutedPeers || [],
+          quarantinedPeers: security.quarantinedPeers || [],
+          voteThreshold: security.voteThreshold ?? 2,
+          pow: security.pow || { enabled: false, difficulty: 3 },
+          rateLimit: security.rateLimit || { windowMs: 10000, maxMessages: 40, banMs: 60000 }
+        },
+        sla: settings.sla || {},
+        sync: settings.sync || {}
+      },
+      signer: {
+        peerId: identity?.peerId || null,
+        fingerprint: identity?.publicKeyFingerprint || null,
+        publicKeyJwk: identity?.publicKeyJwk || null
+      }
+    };
+  }, [identity?.peerId, identity?.publicKeyFingerprint, identity?.publicKeyJwk, settings.security, settings.sla, settings.sync]);
+
   const getEventSignPayload = useCallback((evt) => ({
     id: evt.id,
     type: evt.type,
@@ -940,16 +993,22 @@ function App() {
     sig: evt.sig || null
   }), [getEventSignPayload]);
 
-  const computeEventLogHash = useCallback(async (events) => {
+  const computeEventLogHash = useCallback(async (events, options = {}) => {
+    const allowLooseStart = !!options.allowLooseStart;
     const ordered = [...(events || [])].sort(compareEventsAsc);
     let prevHash = EVENT_CHAIN_GENESIS;
-    for (const evt of ordered) {
+    for (let i = 0; i < ordered.length; i++) {
+      const evt = ordered[i];
+      if (evt.prevHash && evt.prevHash !== prevHash) {
+        if (allowLooseStart && i === 0) {
+          prevHash = evt.prevHash;
+        } else {
+          return { ok: false, hash: null };
+        }
+      }
       const chainPayload = { prevHash, event: getEventChainPayload(evt) };
       const chainHash = await hashPayload(chainPayload);
       if (evt.chainHash && evt.chainHash !== chainHash) {
-        return { ok: false, hash: null };
-      }
-      if (evt.prevHash && evt.prevHash !== prevHash) {
         return { ok: false, hash: null };
       }
       prevHash = chainHash;
@@ -986,6 +1045,15 @@ function App() {
     return await verifyPayload(snapshotEnvelope.signer.publicKeyJwk, getSnapshotSignPayload(snapshotEnvelope), snapshotEnvelope.sig);
   }, [getSnapshotSignPayload]);
 
+  const verifyPolicyEnvelope = useCallback(async (envelope) => {
+    if (!envelope?.policy || !envelope?.signer?.publicKeyJwk || !envelope?.signer?.fingerprint || !envelope?.sig) return false;
+    const verified = await verifyPayload(envelope.signer.publicKeyJwk, { policy: envelope.policy, signer: envelope.signer }, envelope.sig);
+    if (!verified) return false;
+    const computed = await fingerprintFromPublicJwk(envelope.signer.publicKeyJwk);
+    if (!computed || computed !== envelope.signer.fingerprint) return false;
+    return true;
+  }, []);
+
   const verifySnapshotSigner = useCallback(async (snapshotEnvelope, peerIdToCheck) => {
     const signer = snapshotEnvelope?.signer;
     if (!signer?.publicKeyJwk || !signer?.fingerprint) return false;
@@ -997,6 +1065,13 @@ function App() {
     }
     return true;
   }, [knownPeersById]);
+
+  const verifySnapshotSignerLoose = useCallback(async (snapshotEnvelope) => {
+    const signer = snapshotEnvelope?.signer;
+    if (!signer?.publicKeyJwk || !signer?.fingerprint) return false;
+    const computedFingerprint = await fingerprintFromPublicJwk(signer.publicKeyJwk);
+    return !!computedFingerprint && computedFingerprint === signer.fingerprint;
+  }, []);
 
   const shouldAllowInbound = useCallback((peerIdToCheck) => {
     const muted = settings.security?.mutedPeers || [];
@@ -1130,8 +1205,81 @@ function App() {
     const payload = getIdentityPayload();
     if (!payload || !identity?.privateKeyJwk) return;
     const sig = await signPayload(identity.privateKeyJwk, payload);
-    try { conn.send({ type: 'hello', identity: payload, sig }); } catch (e) {}
-  }, [getIdentityPayload, identity?.privateKeyJwk]);
+    let pow = null;
+    const powCfg = settings.security?.pow || { enabled: false, difficulty: 3 };
+    if (powCfg.enabled && payload.peerId && payload.publicKeyFingerprint) {
+      pow = await generatePowToken(payload.peerId, payload.publicKeyFingerprint, powCfg.difficulty);
+      if (!pow) {
+        logSync('PoW generation failed; sending hello without proof', 'warning');
+      }
+    }
+    try { conn.send({ type: 'hello', identity: payload, sig, pow }); } catch (e) {}
+  }, [getIdentityPayload, identity?.privateKeyJwk, logSync, settings.security]);
+
+  const sendPolicyToAll = useCallback(async () => {
+    if (!identity?.privateKeyJwk) return;
+    const payload = getPolicyPayload();
+    if (!payload?.policy || !payload?.signer?.publicKeyJwk || !payload?.signer?.fingerprint) return;
+    const sig = await signPayload(identity.privateKeyJwk, { policy: payload.policy, signer: payload.signer });
+    const envelope = { type: 'policy', policy: payload.policy, signer: payload.signer, sig };
+    let sent = 0;
+    connsRef.current.forEach(conn => {
+      if (conn.open) {
+        try { conn.send(envelope); sent++; } catch (e) {}
+      }
+    });
+    if (!sent) {
+      logSync('No open connections to share policy', 'warning');
+    } else {
+      logSync(`Policy shared with ${sent} peer(s)`);
+      logAudit(`Policy shared`, 'info', identity.peerId, { eventType: 'PolicySync', actorFingerprint: identity.publicKeyFingerprint });
+    }
+  }, [getPolicyPayload, identity?.peerId, identity?.privateKeyJwk, identity?.publicKeyFingerprint, logAudit, logSync]);
+
+  const getPeerListEnvelope = useCallback(async () => {
+    if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return null;
+    const peers = [
+      {
+        peerId: identity.peerId,
+        displayName: identity.displayName,
+        role: identity.role,
+        publicKeyFingerprint: identity.publicKeyFingerprint,
+        publicKeyJwk: identity.publicKeyJwk,
+        createdAt: identity.createdAt
+      },
+      ...Array.from(knownPeersRef.current.values())
+    ];
+    const signer = {
+      peerId: identity.peerId,
+      fingerprint: identity.publicKeyFingerprint,
+      publicKeyJwk: identity.publicKeyJwk
+    };
+    const sig = await signPayload(identity.privateKeyJwk, { peers, signer });
+    return { type: 'peer_list', peers, signer, sig };
+  }, [identity]);
+
+  const sendPeerListToAll = useCallback(async () => {
+    const envelope = await getPeerListEnvelope();
+    if (!envelope) return;
+    let sent = 0;
+    connsRef.current.forEach(conn => {
+      if (conn.open) {
+        try { conn.send(envelope); sent++; } catch (e) {}
+      }
+    });
+    if (!sent) {
+      logSync('No open connections to share peer list', 'warning');
+    } else {
+      logSync(`Peer list shared with ${sent} peer(s)`);
+      logAudit('Peer list shared', 'info', identity?.peerId || null, { eventType: 'PeerDiscovery' });
+    }
+  }, [getPeerListEnvelope, identity?.peerId, logAudit, logSync]);
+
+  const sendPeerListToConn = useCallback(async (conn) => {
+    const envelope = await getPeerListEnvelope();
+    if (!envelope || !conn?.open) return;
+    try { conn.send(envelope); } catch (e) {}
+  }, [getPeerListEnvelope]);
 
   const createSignedEvent = useCallback(async (evt) => {
     if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return null;
@@ -1161,14 +1309,33 @@ function App() {
 
   const sendSnapshot = useCallback(async (conn) => {
     if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
-    const snapshotEvents = stateRef.current.events.slice(0, 200);
-    const eventLog = await computeEventLogHash(snapshotEvents);
+    const recentMinutes = settings.sync?.recentMinutes || 0;
+    const scope = settings.sync?.scope || 'all';
+    let snapshotTickets = stateRef.current.tickets;
+    if (scope !== 'all' && identity?.peerId) {
+      snapshotTickets = snapshotTickets.filter(t => {
+        if (scope === 'assigned') return t.agentId === identity.peerId;
+        if (scope === 'own') return t.agentId === identity.peerId || t.customerPeerId === identity.peerId;
+        return true;
+      });
+    }
+    const allowedIds = new Set(snapshotTickets.map(t => t.id));
+    let snapshotEvents = stateRef.current.events.slice(0, 200).filter(e => {
+      if (!e.ticketId) return scope === 'all';
+      return allowedIds.has(e.ticketId);
+    });
+    if (recentMinutes > 0) {
+      const cutoff = Date.now() - recentMinutes * 60 * 1000;
+      snapshotEvents = snapshotEvents.filter(e => new Date(e.ts).getTime() >= cutoff);
+    }
+    const isPartial = recentMinutes > 0 || scope !== 'all';
+    const eventLog = await computeEventLogHash(snapshotEvents, { allowLooseStart: isPartial });
     if (!eventLog.ok) {
       logSync('Snapshot aborted: invalid event chain', 'warning');
       return;
     }
     const snapshot = {
-      tickets: stateRef.current.tickets,
+      tickets: snapshotTickets,
       events: snapshotEvents,
       meta: {
         snapshotVersion: 1,
@@ -1176,7 +1343,10 @@ function App() {
         eventSeq: eventSeqRef.current,
         eventChainVersion: 1,
         eventLogHash: eventLog.hash,
-        eventLogHashAlgo: 'sha256'
+        eventLogPartial: isPartial,
+        eventLogHashAlgo: 'sha256',
+        syncScope: scope,
+        syncRecentMinutes: recentMinutes
       }
     };
     const signer = {
@@ -1193,7 +1363,7 @@ function App() {
     } catch (e) {
       logSync(`Snapshot failed to ${conn.peer}`, 'error');
     }
-  }, [bumpSnapshotSeq, computeEventLogHash, getSnapshotSignPayload, identity, logSync, syncMeta]);
+  }, [bumpSnapshotSeq, computeEventLogHash, getSnapshotSignPayload, identity, logSync, settings.sync, syncMeta]);
 
   const sendSnapshotToAll = useCallback(() => {
     let sent = 0;
@@ -1205,6 +1375,60 @@ function App() {
     });
     if (!sent) logSync('No open connections to sync', 'warning');
   }, [logSync, sendSnapshot]);
+
+  const exportStateSnapshot = useCallback(async () => {
+    if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
+    const snapshotEvents = stateRef.current.events.slice(0, 200);
+    const eventLog = await computeEventLogHash(snapshotEvents);
+    if (!eventLog.ok) {
+      logSync('State export aborted: invalid event chain', 'warning');
+      logAudit('State export aborted (invalid event chain)', 'warning', identity.peerId);
+      return;
+    }
+    const snapshot = {
+      tickets: stateRef.current.tickets,
+      events: snapshotEvents,
+      meta: {
+        snapshotVersion: 1,
+        snapshotSeq: snapshotSeqRef.current + 1,
+        eventSeq: eventSeqRef.current,
+        eventChainVersion: 1,
+        eventLogHash: eventLog.hash,
+        eventLogHashAlgo: 'sha256'
+      }
+    };
+    const signer = {
+      peerId: identity.peerId,
+      fingerprint: identity.publicKeyFingerprint,
+      publicKeyJwk: identity.publicKeyJwk
+    };
+    const envelope = { type: 'snapshot', snapshot, signer };
+    const sig = await signPayload(identity.privateKeyJwk, getSnapshotSignPayload(envelope));
+    downloadJson(`meshdesk-state-${identity.peerId}-${Date.now()}.json`, { ...envelope, sig });
+    logAudit('State export completed', 'info', identity.peerId, { eventType: 'StateExport' });
+  }, [computeEventLogHash, getSnapshotSignPayload, identity, logAudit, logSync]);
+
+  const acceptPolicyProposal = useCallback((policyEntry) => {
+    if (!policyEntry?.policy) return;
+    setSettings(s => ({
+      ...s,
+      security: {
+        ...s.security,
+        ...(policyEntry.policy.security || {}),
+        rateLimit: { ...s.security.rateLimit, ...(policyEntry.policy.security?.rateLimit || {}) }
+      },
+      sla: { ...s.sla, ...(policyEntry.policy.sla || {}) },
+      sync: { ...s.sync, ...(policyEntry.policy.sync || {}) }
+    }));
+    setPendingPolicies(prev => prev.filter(p => p.id !== policyEntry.id));
+    logAudit('Policy accepted', 'info', policyEntry.signer?.peerId || null, { eventType: 'PolicySync', signerFingerprint: policyEntry.signer?.fingerprint || null });
+  }, [logAudit]);
+
+  const rejectPolicyProposal = useCallback((policyEntry) => {
+    if (!policyEntry) return;
+    setPendingPolicies(prev => prev.filter(p => p.id !== policyEntry.id));
+    logAudit('Policy rejected', 'info', policyEntry.signer?.peerId || null, { eventType: 'PolicySync', signerFingerprint: policyEntry.signer?.fingerprint || null });
+  }, [logAudit]);
 
   const applySnapshot = useCallback((snapshot) => {
     if (!snapshot) return;
@@ -1230,6 +1454,26 @@ function App() {
     setTimeout(() => { suppressBroadcastRef.current = false; }, 0);
   }, [observeLamport]);
 
+  const importStateSnapshot = useCallback(async (text) => {
+    try {
+      const data = JSON.parse(text || '');
+      if (!data?.snapshot || !data?.signer || !data?.sig) return { ok: false, msg: 'Invalid snapshot file.' };
+      const verified = await verifySignedSnapshot(data);
+      if (!verified) return { ok: false, msg: 'Snapshot signature invalid.' };
+      const signerOk = await verifySnapshotSignerLoose(data);
+      if (!signerOk) return { ok: false, msg: 'Signer fingerprint mismatch.' };
+      const declaredHash = data.snapshot?.meta?.eventLogHash;
+      if (!declaredHash) return { ok: false, msg: 'Snapshot missing event log hash.' };
+      const eventLog = await computeEventLogHash(data.snapshot?.events || [], { allowLooseStart: !!data.snapshot?.meta?.eventLogPartial });
+      if (!eventLog.ok || eventLog.hash !== declaredHash) return { ok: false, msg: 'Snapshot event log hash mismatch.' };
+      applySnapshot(data.snapshot);
+      logAudit('State import completed', 'info', data.signer?.peerId || null, { eventType: 'StateImport', signerFingerprint: data.signer?.fingerprint || null });
+      return { ok: true, msg: 'State imported successfully.' };
+    } catch (e) {
+      return { ok: false, msg: 'Failed to parse snapshot.' };
+    }
+  }, [applySnapshot, computeEventLogHash, logAudit, verifySignedSnapshot, verifySnapshotSignerLoose]);
+
   const handleIncomingSnapshot = useCallback(async (data, peerIdToCheck) => {
     if (!data?.snapshot) return;
     if (!shouldAllowInbound(peerIdToCheck)) return;
@@ -1248,7 +1492,7 @@ function App() {
       adjustReputation(peerIdToCheck, signerFingerprint, -8, 'snapshot signer mismatch');
       return;
     }
-    const eventLog = await computeEventLogHash(data.snapshot?.events || []);
+    const eventLog = await computeEventLogHash(data.snapshot?.events || [], { allowLooseStart: !!data.snapshot?.meta?.eventLogPartial });
     if (!eventLog.ok) {
       logSync(`Snapshot event chain invalid from ${peerIdToCheck}`, 'warning');
       logAudit(`Snapshot event chain invalid`, 'warning', peerIdToCheck, { signerFingerprint });
@@ -1431,6 +1675,18 @@ function App() {
           void (async () => {
             const verified = await verifySignedIdentity(data.identity, data.sig);
             if (verified) {
+              const powCfg = settings.security?.pow || { enabled: false, difficulty: 3 };
+              const isTrusted = settings.security?.trustedElevated?.includes(data.identity.publicKeyFingerprint);
+              const known = knownPeersRef.current.get(data.identity.publicKeyFingerprint);
+              if (powCfg.enabled && !isTrusted && !known) {
+                const ok = await verifyPowToken(data.pow, data.identity.peerId, data.identity.publicKeyFingerprint, powCfg.difficulty);
+                if (!ok) {
+                  logSync(`PoW rejected from ${conn.peer}`, 'warning');
+                  logAudit('PoW rejected', 'warning', conn.peer, { eventType: 'PoW', signerFingerprint: data.identity.publicKeyFingerprint });
+                  try { conn.close(); } catch (e) {}
+                  return;
+                }
+              }
               upsertKnownPeer(data.identity);
               logSync(`Hello from ${data.identity.displayName || conn.peer}`);
             } else {
@@ -1453,12 +1709,50 @@ function App() {
         logSync(`Snapshot requested by ${conn.peer}`);
         void sendSnapshot(conn);
       }
+      if (data.type === 'req_peer_list') {
+        logSync(`Peer list requested by ${conn.peer}`);
+        void sendPeerListToConn(conn);
+      }
       if (data.type === 'snapshot') {
         void (async () => {
           await handleIncomingSnapshot(data, conn.peer);
           logSync(`Snapshot synced with ${conn.peer}`);
         })();
         setGossipRound(prev => prev + 1);
+      }
+      if (data.type === 'peer_list') {
+        void (async () => {
+          const ok = await verifyPayload(data?.signer?.publicKeyJwk, { peers: data.peers, signer: data.signer }, data.sig);
+          if (!ok) {
+            logAudit('Peer list signature invalid', 'warning', conn.peer, { eventType: 'PeerDiscovery', signerFingerprint: data?.signer?.fingerprint || null });
+            return;
+          }
+          const computed = await fingerprintFromPublicJwk(data?.signer?.publicKeyJwk);
+          if (!computed || computed !== data?.signer?.fingerprint) {
+            logAudit('Peer list signer mismatch', 'warning', conn.peer, { eventType: 'PeerDiscovery', signerFingerprint: data?.signer?.fingerprint || null });
+            return;
+          }
+          (data.peers || []).forEach(p => upsertKnownPeer(p));
+          logSync(`Peer list received from ${conn.peer}`);
+          logAudit('Peer list received', 'info', conn.peer, { eventType: 'PeerDiscovery', signerFingerprint: data?.signer?.fingerprint || null });
+        })();
+      }
+      if (data.type === 'policy') {
+        void (async () => {
+          const ok = await verifyPolicyEnvelope(data);
+          if (!ok) {
+            logSync(`Policy signature invalid from ${conn.peer}`, 'warning');
+            logAudit('Invalid policy signature', 'warning', conn.peer, { eventType: 'PolicySync', signerFingerprint: data?.signer?.fingerprint || null });
+            return;
+          }
+          setPendingPolicies(prev => {
+            const exists = prev.some(p => p.signer?.fingerprint === data.signer?.fingerprint && stableStringify(p.policy) === stableStringify(data.policy));
+            if (exists) return prev;
+            return [{ id: genId(), ts: new Date().toISOString(), policy: data.policy, signer: data.signer, sig: data.sig }, ...prev].slice(0, 50);
+          });
+          logSync(`Policy proposal received from ${conn.peer}`);
+          logAudit('Policy proposal received', 'info', conn.peer, { eventType: 'PolicySync', signerFingerprint: data?.signer?.fingerprint || null });
+        })();
       }
       if (data.type === 'peer_vote') {
         void (async () => {
@@ -1504,7 +1798,7 @@ function App() {
       } catch (e) {}
     }
     if (conn.open) handleOpen();
-  }, [flushOutbox, handleIncomingEvent, handleIncomingSnapshot, logSync, sendHello, sendSnapshot, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
+  }, [flushOutbox, handleIncomingEvent, handleIncomingSnapshot, logAudit, logSync, sendHello, sendPeerListToConn, sendSnapshot, settings.security, updateConnectionsState, upsertKnownPeer, verifySignedIdentity]);
 
   useEffect(() => { setupConnectionRef.current = setupConnection; }, [setupConnection]);
   useEffect(() => { logSyncRef.current = logSync; }, [logSync]);
@@ -2324,7 +2618,16 @@ function App() {
             mutedPeers: settings.security?.mutedPeers || [],
             quarantinedPeers: settings.security?.quarantinedPeers || [],
             onQuarantine: addQuarantine,
-            onReleaseQuarantine: removeQuarantine
+            onReleaseQuarantine: removeQuarantine,
+            onSharePeerList: sendPeerListToAll,
+            onRequestPeerList: (peerIdToRequest) => {
+              const conn = connsRef.current.get(peerIdToRequest);
+              if (!conn || !conn.open) {
+                logSync(`Cannot request peer list from ${peerIdToRequest}`, 'warning');
+                return;
+              }
+              try { conn.send({ type: 'req_peer_list' }); } catch (e) {}
+            }
           }),
           view === 'audit' && h(AuditView, {
             auditLog,
@@ -2401,13 +2704,36 @@ function App() {
             mutedPeers: settings.security?.mutedPeers || [],
             trustedElevated: settings.security?.trustedElevated || []
           }),
-            view === 'settings' && h(SettingsView, { identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents: agentsList, knownPeers })
+            view === 'settings' && h(SettingsView, {
+              identity,
+              setIdentity,
+              setPeerId,
+              settings,
+              setSettings,
+              isDark,
+              state,
+              agents: agentsList,
+              knownPeers,
+              onSendPolicy: sendPolicyToAll,
+              pendingPolicies,
+              onAcceptPolicy: acceptPolicyProposal,
+              onRejectPolicy: rejectPolicyProposal,
+              onExportState: exportStateSnapshot,
+              onImportState: importStateSnapshot
+            })
         ),
 
         // Footer
         h('footer', { className: `h-8 flex items-center justify-center border-t text-xs flex-shrink-0 ${isDark ? 'bg-slate-900 border-slate-800 text-slate-500' : 'bg-white border-slate-200 text-slate-400'}` },
-          'Powered by MeshDesk — Decentralized Support · ',
-          h('a', { href: '/remix', className: 'text-brand-500 hover:text-brand-400 ml-1' }, 'Remix on Berrry')
+          h('div', { className: 'flex items-center gap-2' },
+            h('span', null, 'Powered by'),
+            h('a', {
+              href: 'https://fractal.co.ke',
+              className: 'font-semibold text-brand-400 hover:text-brand-300 tracking-wide'
+            }, 'Fractal'),
+            h('span', { className: isDark ? 'text-slate-600' : 'text-slate-300' }, '•'),
+            h('span', { className: 'uppercase text-[10px] tracking-[0.2em] text-slate-500' }, 'Decentralized Support')
+          )
         )
       ),
 
@@ -3057,7 +3383,7 @@ function EscalationsView({ state, isDark, onClaim, identity, slaConfig }) {
 }
 
 // ============ NETWORK VIEW ============
-function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS, knownPeersById, outbox, onFlushOutbox, onClearOutbox, peerVotes, onVoteMute, mutedPeers, quarantinedPeers, onQuarantine, onReleaseQuarantine }) {
+function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus, peerId, connections, connectTarget, setConnectTarget, onConnectPeer, onDisconnectPeer, onSyncNow, onRequestSnapshot, onPingPeer, onReconnectPeerJS, knownPeersById, outbox, onFlushOutbox, onClearOutbox, peerVotes, onVoteMute, mutedPeers, quarantinedPeers, onQuarantine, onReleaseQuarantine, onSharePeerList, onRequestPeerList }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const nodesRef = useRef([]);
@@ -3310,6 +3636,12 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
               onClick: onReconnectPeerJS,
               className: `px-3 py-2 text-xs rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'}`
             }, 'Reconnect PeerJS')
+          ),
+          h('div', { className: 'mt-2 flex items-center gap-2' },
+            h('button', {
+              onClick: onSharePeerList,
+              className: `px-3 py-2 text-xs rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'}`
+            }, 'Share Peer List')
           )
         ),
         h('div', { className: 'min-w-[240px] w-full max-w-sm' },
@@ -3362,6 +3694,10 @@ function NetworkView({ state, isDark, gossipRound, syncLog, identity, peerStatus
                   onClick: () => onRequestSnapshot(c.peerId),
                   className: 'text-[11px] px-2 py-1 rounded-md bg-brand-500/10 text-brand-400 hover:bg-brand-500/20'
                 }, 'Request Sync'),
+                h('button', {
+                  onClick: () => onRequestPeerList?.(c.peerId),
+                  className: 'text-[11px] px-2 py-1 rounded-md bg-slate-500/10 text-slate-400 hover:bg-slate-500/20'
+                }, 'Peer List'),
                 h('button', {
                   onClick: () => onVoteMute?.(c.peerId),
                   className: 'text-[11px] px-2 py-1 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
@@ -3585,12 +3921,14 @@ function AuditView({ auditLog, isDark, onTrustSigner, onRequestSnapshot, onMuteP
 }
 
 // ============ SETTINGS VIEW ============
-function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents, knownPeers }) {
+function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings, isDark, state, agents, knownPeers, onSendPolicy, pendingPolicies, onAcceptPolicy, onRejectPolicy, onExportState, onImportState }) {
   const [editName, setEditName] = useState(identity?.displayName || '');
   const [editRole, setEditRole] = useState(identity?.role || 'L1');
   const [trustInput, setTrustInput] = useState('');
   const [importText, setImportText] = useState('');
   const [importStatus, setImportStatus] = useState(null);
+  const [stateImportText, setStateImportText] = useState('');
+  const [stateImportStatus, setStateImportStatus] = useState(null);
   const [recoveryPhrase, setRecoveryPhrase] = useState('');
   const [recoveryConfirm, setRecoveryConfirm] = useState('');
   const [recoveryBundleText, setRecoveryBundleText] = useState('');
@@ -3669,6 +4007,17 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       setImportStatus({ type: 'success', msg: 'Identity imported successfully.' });
     } catch (e) {
       setImportStatus({ type: 'error', msg: 'Invalid identity bundle.' });
+    }
+  };
+
+  const handleImportState = async () => {
+    if (!onImportState) return;
+    const result = await onImportState(stateImportText);
+    if (result?.ok) {
+      setStateImportStatus({ type: 'success', msg: result.msg || 'State imported.' });
+      setStateImportText('');
+    } else {
+      setStateImportStatus({ type: 'error', msg: result?.msg || 'State import failed.' });
     }
   };
 
@@ -3877,6 +4226,28 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       rotationStatus && h('div', { className: `mt-2 text-xs ${rotationStatus.type === 'error' ? 'text-red-400' : rotationStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, rotationStatus.msg)
     ),
 
+    // State export/import
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'State Export & Import'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Export a signed snapshot of the current state or import one with validation.'),
+      h('div', { className: 'flex flex-wrap gap-2 mb-4' },
+        h('button', { onClick: onExportState, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Export State Snapshot'),
+        h('button', { onClick: () => setStateImportText(''), className: `px-4 py-2 text-sm rounded-lg font-medium border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Clear Import')
+      ),
+      h('div', { className: 'space-y-2' },
+        h('label', { className: 'text-sm text-slate-400 block' }, 'Import State Snapshot'),
+        h('textarea', {
+          rows: 5,
+          value: stateImportText,
+          onChange: e => setStateImportText(e.target.value),
+          placeholder: 'Paste snapshot JSON here',
+          className: `w-full px-3 py-2 text-xs rounded-lg border font-mono ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('button', { onClick: handleImportState, className: 'px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Import State')
+      ),
+      stateImportStatus && h('div', { className: `mt-3 text-xs ${stateImportStatus.type === 'error' ? 'text-red-400' : stateImportStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, stateImportStatus.msg)
+    ),
+
     // Trust & roles
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Trust & Role Enforcement'),
@@ -3946,6 +4317,104 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
               )
             )
         )
+      )
+    ),
+
+    // Sybil resistance
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Sybil Resistance (Proof of Work)'),
+      h('div', { className: 'flex items-center justify-between mb-3' },
+        h('div', null,
+          h('div', { className: 'text-sm' }, 'Require PoW for new peers'),
+          h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Unknown peers must present a PoW token on hello.')
+        ),
+        h('button', {
+          onClick: () => setSettings(s => ({
+            ...s,
+            security: { ...s.security, pow: { ...(s.security?.pow || { enabled: false, difficulty: 3 }), enabled: !(s.security?.pow?.enabled) } }
+          })),
+          className: `w-12 h-6 rounded-full transition-colors relative ${settings.security?.pow?.enabled ? 'bg-brand-500' : isDark ? 'bg-slate-700' : 'bg-slate-300'}`
+        },
+          h('div', {
+            className: 'w-5 h-5 rounded-full bg-white absolute top-0.5 transition-all shadow',
+            style: { left: settings.security?.pow?.enabled ? 26 : 2 }
+          })
+        )
+      ),
+      h('div', null,
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Difficulty (leading zeros)'),
+        h('input', {
+          type: 'number',
+          min: 1,
+          max: 6,
+          value: settings.security?.pow?.difficulty ?? 3,
+          onChange: e => setSettings(s => ({
+            ...s,
+            security: {
+              ...s.security,
+              pow: { ...(s.security?.pow || { enabled: false, difficulty: 3 }), difficulty: Math.max(1, Math.min(6, Number(e.target.value) || 1)) }
+            }
+          })),
+          className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Higher difficulty slows joins. Keep low for demo.')
+      )
+    ),
+
+    // Policy sync
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Policy Synchronization'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Share your local policy set or accept proposals from peers.'),
+      h('div', { className: 'flex flex-wrap gap-2 mb-4' },
+        h('button', { onClick: onSendPolicy, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Share Policy')
+      ),
+      (pendingPolicies || []).length === 0 ?
+        h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No pending policy proposals.') :
+        h('div', { className: 'space-y-2' },
+          pendingPolicies.map(p =>
+            h('div', { key: p.id, className: `rounded-lg px-3 py-2 text-xs border ${isDark ? 'border-slate-700 text-slate-300' : 'border-slate-200 text-slate-600'}` },
+              h('div', { className: 'flex items-center justify-between gap-2' },
+                h('div', null,
+                  h('div', { className: 'font-medium' }, p.signer?.peerId || 'Peer'),
+                  h('div', { className: 'font-mono break-all' }, p.signer?.fingerprint || 'unknown')
+                ),
+                h('div', { className: 'flex gap-2' },
+                  h('button', { onClick: () => onAcceptPolicy?.(p), className: 'text-emerald-400 hover:text-emerald-300 text-xs' }, 'Accept'),
+                  h('button', { onClick: () => onRejectPolicy?.(p), className: 'text-red-400 hover:text-red-300 text-xs' }, 'Reject')
+                )
+              )
+            )
+          )
+        )
+    ),
+
+    // Sync preferences
+    h('div', { className: `rounded-xl border ${bg} p-6` },
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Sync Preferences'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limit snapshots to recent events to reduce bandwidth.'),
+      h('div', null,
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Scope'),
+        h('select', {
+          value: settings.sync?.scope || 'all',
+          onChange: e => setSettings(s => ({ ...s, sync: { ...s.sync, scope: e.target.value } })),
+          className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        },
+          h('option', { value: 'all' }, 'All tickets'),
+          h('option', { value: 'assigned' }, 'Assigned to me'),
+          h('option', { value: 'own' }, 'Assigned or owned by me')
+        ),
+        h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limits which tickets/events are included in snapshots.')
+      ),
+      h('div', { className: 'mt-3' },
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recent Events Window (minutes)'),
+        h('input', {
+          type: 'number',
+          min: 0,
+          value: settings.sync?.recentMinutes || 0,
+          onChange: e => setSettings(s => ({ ...s, sync: { ...s.sync, recentMinutes: Math.max(0, Number(e.target.value) || 0) } })),
+          className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Set to 0 for full bounded history.')
       )
     ),
 

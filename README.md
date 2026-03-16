@@ -12,6 +12,11 @@ This build includes security and consistency hardening:
 - SLA timers with automated escalation rules and supervisor alerts.
 - Ticket-level access control (ACL) scaffolding for restricted visibility.
 - Recovery phrase + encrypted identity bundle + key rotation.
+- Signed peer discovery (peer list gossip).
+- Optional sybil resistance via proof-of-work on new peer hellos.
+- Policy synchronization with signed proposals and local acceptance.
+- Full state export/import with signed snapshot validation.
+- Selective sync by scope (all/assigned/own) and recency window.
 
 ## Quick Start (Local)
 
@@ -81,6 +86,9 @@ Result:
 - Events are signed and broadcast; snapshots are signed and sent on connect or request.
 - Snapshots include metadata: `snapshotVersion`, `snapshotSeq`, and `eventSeq`.
 - Event history is bounded to the most recent 200 events.
+- Selective sync is supported:
+  - Scope: `all`, `assigned`, `own`
+  - Recency window (minutes)
 
 If you want to force a resync:
 1. Open **Network** view.
@@ -106,7 +114,7 @@ To adjust limits:
 
 - `meshdesk_identity`: keypair, fingerprint, display name, role, rotation metadata
 - `meshdesk_state`: tickets, events, meta (Lamport/event/snapshot counters)
-- `meshdesk_settings`: theme, network config, trust list, rate limits, SLA policy, governance
+- `meshdesk_settings`: theme, network config, trust list, rate limits, SLA policy, governance, sync policy, PoW
 - `meshdesk_outbox`: offline outbound queue (events and governance messages)
 - `meshdesk_peer_votes`: local governance vote tally (per peer)
 - `meshdesk_peer_reputation`: local reputation scores
@@ -121,6 +129,10 @@ MeshDesk includes lightweight, local-only governance:
 Configure in **Settings -> Governance Controls**:
 - **Vote Threshold (weight)**: how much vote weight is required to quarantine.
 - **Quarantined Peers**: list of currently quarantined peers with release controls.
+
+## Policy Synchronization
+
+Peers can share signed policy proposals (security, SLA, sync). Proposals appear in **Settings -> Policy Synchronization** with Accept/Reject controls. Policy acceptance is local and explicit.
 
 ## Offline Outbox (Guaranteed Delivery)
 
@@ -270,3 +282,20 @@ If the Network log shows "Connected" but no "Snapshot synced":
 
 - The app stores data in `localStorage` per browser.
 - WebRTC requires a signaling server (PeerJS). TURN is required for reliability across NAT/firewalls.
+## State Export / Import
+
+In **Settings -> State Export & Import** you can:
+- Export a signed snapshot of current state.
+- Import a snapshot with signature + event log hash validation.
+
+## Peer Discovery
+
+Peers can share signed peer lists (gossip) to help discovery.
+- **Network -> Share Peer List** broadcasts your roster.
+- **Peer List** button requests a roster from a specific peer.
+
+## Sybil Resistance (PoW)
+
+Optional proof-of-work can be required for new peers:
+- **Settings -> Sybil Resistance (Proof of Work)**
+- Unknown peers must include a valid PoW token with hello.

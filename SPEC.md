@@ -1,9 +1,9 @@
 **Current Implementation (as-is)**
 
 Single-file SPA: `index.html` loads React UMD, Tailwind CDN, PeerJS; main logic in `app.js`.
-Storage model: `meshdesk_state` v3 with lamport, eventSeq, snapshotSeq, bounded events + event-log hash; `meshdesk_identity` holds ECDSA keypair JWKs + fingerprint + peerId; `meshdesk_settings` includes trust, governance, SLA, and rate-limit policy. See `app.js`.
+Storage model: `meshdesk_state` v3 with lamport, eventSeq, snapshotSeq, bounded events + event-log hash; `meshdesk_identity` holds ECDSA keypair JWKs + fingerprint + peerId; `meshdesk_settings` includes trust, governance, SLA, sync, and rate-limit policy. See `app.js`.
 
-Security & consistency hardening now implemented:
+Security and consistency hardening now implemented:
 - Cryptographic identity via WebCrypto P-256 keypair; fingerprint derived from SHA-256 of SPKI.
 - Signed events and signed snapshots.
 - Hash-chained event log (per-event prevHash/chainHash) and snapshot eventLogHash validation.
@@ -16,17 +16,22 @@ Security & consistency hardening now implemented:
 - Ticket-level access control (ACL) scaffolding for restricted visibility.
 - Recovery phrase + encrypted identity bundle + key rotation with rotation proof.
 - Governance controls: vote-to-mute, quarantine, reputation-weighted votes, local reputation scoring.
+- Policy synchronization with signed proposals and local acceptance.
+- Full state export/import with signed snapshot validation.
+- Selective sync by scope (all/assigned/own) and recency window.
+- Peer discovery via signed peer list gossip and request/response.
+- Sybil resistance via optional proof-of-work for new peers.
 
 Networking: PeerJS data channels, manual connect by peer ID, snapshot sync and event broadcast, bounded history.
-UI: dashboard, tickets, chat, agents, escalations, network, audit, settings. Trust allowlist + identity backup + governance + SLA controls in Settings.
-Audit: dedicated panel for signature failures, snapshot mismatches, chain errors, soft bans, and governance/reputation actions. Filter/search + export JSON/CSV.
+UI: dashboard, tickets, chat, agents, escalations, network, audit, settings. Trust allowlist + identity backup + governance + SLA + sync controls in Settings.
+Audit: dedicated panel for signature failures, snapshot mismatches, chain errors, soft bans, governance actions. Filter/search + export JSON/CSV and action buttons.
 
 **Kanban (Game-Theory Lens)**
 Below are features framed by incentives, defection, and coordination problems in a decentralized system. Each item targets an equilibrium where honest/cooperative behavior is the rational choice.
 
 **Now (Implemented)**
 1. Stronger Event Provenance
-Gap: Events are signed but there’s no hash-chain or append-only log.
+Gap: Events are signed but there is no hash-chain or append-only log.
 Implemented: Hash-chained event log with per-event prevHash/chainHash.
 Game-theory issue: Event omission or selective history is profitable.
 Feature: Hash-chained event log and event-sequence validation on snapshot.
@@ -77,47 +82,46 @@ Implemented: Local reputation scoring used for vote weighting; audit-backed adju
 Game-theory issue: Free-rider equilibrium.
 Next: Use reputation to prefer peers for sync and relay.
 
-**Next (Planned)**
-1. Sybil Resistance Beyond Local Trust
-Gap: Trust allowlist is local only; no network-level sybil deterrence.
-Game-theory issue: Cheap identities can flood or manipulate.
-Feature: Proof-of-work throttling for new peers, or invite-signed onboarding.
+10. Peer Discovery / Room Governance
+Gap: Manual peer ID connect; no discovery or governance.
+Implemented: Signed peer list gossip + request/response for peer rosters.
+Game-theory issue: Coordination failure is a dominant outcome.
+Next: Optional hub / signed room roster for broader discovery.
 
-2. Explicit Arbitration for Disputes
-Gap: Conflict resolution is deterministic but doesn’t capture business rules for disputes.
-Game-theory issue: Parties may “race” valid updates to win.
+11. Sybil Resistance Beyond Local Trust
+Gap: Trust allowlist is local only; no network-level sybil deterrence.
+Implemented: Optional proof-of-work requirement for new peers (hello handshake).
+Game-theory issue: Cheap identities can flood or manipulate.
+Next: Invite-signed onboarding or adaptive PoW by reputation.
+
+12. Larger Scalability Controls (Selective Sync)
+Gap: All events broadcast to all peers; bounded history only.
+Implemented: Selective snapshot sync by scope (all/assigned/own) + recency window.
+Game-theory issue: Rational peers may drop due to cost.
+Next: Compression and per-ticket selective sync.
+
+13. Policy Synchronization
+Gap: Trust list and rate limits are local; no consistency expectations.
+Implemented: Policy sharing with signature and local acceptance.
+Game-theory issue: Misaligned policies create coordination failures.
+
+14. Data Export / Backup (Full State)
+Gap: No export/import of full state.
+Implemented: Export signed snapshots, import with validation.
+Game-theory issue: Lock-in and data loss increase defection risk.
+
+**Next (Planned)**
+1. Explicit Arbitration for Disputes
+Gap: Conflict resolution is deterministic but does not capture business rules for disputes.
+Game-theory issue: Parties may race valid updates to win.
 Feature: State machine rules for ticket transitions with role-based constraints.
 
-3. Peer Discovery / Room Governance
-Gap: Manual peer ID connect; no discovery or governance.
-Game-theory issue: Coordination failure is a dominant outcome.
-Feature: Optional hub, roster gossip, or signed peer list with opt-in.
-
-4. Larger Scalability Controls
-Gap: All events broadcast to all peers; bounded history only.
-Game-theory issue: Rational peers may drop due to cost.
-Feature: Selective sync (by ticket, by role, by recency), compression.
-
-5. Policy Synchronization
-Gap: Trust list and rate limits are local; no consistency expectations.
-Game-theory issue: Misaligned policies create coordination failures.
-Feature: Optional policy sharing with signature and local acceptance.
-
-6. Data Export / Backup (Full State)
-Gap: No export/import of full state.
-Game-theory issue: Lock-in and data loss increase defection risk.
-Feature: Export signed snapshots, import with validation (identity bundle already implemented).
-
-7. Ticket Data Encryption
+2. Ticket Data Encryption
 Gap: ACL is visibility-only; data not encrypted.
 Game-theory issue: Unauthorized peers could still access if they obtain state.
 Feature: Per-ticket encryption with role/peer key distribution.
 
 **Quick Priority (Highest Game-Theory Impact)**
 - Ticket data encryption (beyond ACL visibility).
-- Full state export/import with validation.
-- Policy synchronization (trust/governance alignment).
-- Peer discovery / room governance.
-- Sybil resistance beyond local trust.
 - Arbitration rules for disputes.
-- Selective sync and compression.
+- Compression and per-ticket selective sync.
