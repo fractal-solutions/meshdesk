@@ -65,6 +65,21 @@ const formatRecoveryPhrase = (base32) => {
   return clean.match(/.{1,4}/g)?.join('-') || clean;
 };
 const parseRecoveryPhrase = (phrase) => (phrase || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+const supportsCompression = () => typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
+const compressJson = async (payload) => {
+  const json = JSON.stringify(payload);
+  if (!supportsCompression()) return { ok: false, error: 'unsupported' };
+  const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+  const compressed = await new Response(stream).arrayBuffer();
+  return { ok: true, data: bufferToBase64(compressed) };
+};
+const decompressJson = async (b64) => {
+  if (!supportsCompression()) return { ok: false, error: 'unsupported' };
+  const buffer = base64ToBuffer(b64 || '');
+  const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+  const text = await new Response(stream).text();
+  return { ok: true, data: JSON.parse(text) };
+};
 const stableStringify = (value) => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
@@ -369,7 +384,11 @@ function loadSettings() {
     },
     sync: {
       recentMinutes: 0,
-      scope: 'all'
+      scope: 'all',
+      ticketIds: [],
+      compression: 'none',
+      maxPeers: 0,
+      preferReputation: true
     },
     peerServer: {
       useCustom: false,
@@ -412,7 +431,7 @@ function loadSettings() {
         },
         peerServer: { ...defaults.peerServer, ...(parsed.peerServer || {}) },
         turn: { ...defaults.turn, ...(parsed.turn || {}) },
-        sync: { ...defaults.sync, ...(parsed.sync || {}) },
+        sync: { ...defaults.sync, ...(parsed.sync || {}), ticketIds: parsed.sync?.ticketIds || defaults.sync.ticketIds },
         sla: {
           ...defaults.sla,
           ...(parsed.sla || {}),
@@ -1104,6 +1123,12 @@ function App() {
     return trusted.includes(fingerprint);
   }, [settings.security]);
 
+  const getRepScoreForPeer = useCallback((peerId) => {
+    const known = knownPeersById.get(peerId);
+    const key = known?.publicKeyFingerprint || peerId;
+    return peerReputation?.[key]?.score ?? 50;
+  }, [knownPeersById, peerReputation]);
+
   const getReputationKey = useCallback((peerId, fingerprint) => {
     return fingerprint || peerId || null;
   }, []);
@@ -1311,6 +1336,7 @@ function App() {
     if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
     const recentMinutes = settings.sync?.recentMinutes || 0;
     const scope = settings.sync?.scope || 'all';
+    const ticketIds = (settings.sync?.ticketIds || []).filter(Boolean);
     let snapshotTickets = stateRef.current.tickets;
     if (scope !== 'all' && identity?.peerId) {
       snapshotTickets = snapshotTickets.filter(t => {
@@ -1319,16 +1345,19 @@ function App() {
         return true;
       });
     }
+    if (ticketIds.length) {
+      snapshotTickets = snapshotTickets.filter(t => ticketIds.includes(t.id));
+    }
     const allowedIds = new Set(snapshotTickets.map(t => t.id));
     let snapshotEvents = stateRef.current.events.slice(0, 200).filter(e => {
-      if (!e.ticketId) return scope === 'all';
+      if (!e.ticketId) return scope === 'all' && ticketIds.length === 0;
       return allowedIds.has(e.ticketId);
     });
     if (recentMinutes > 0) {
       const cutoff = Date.now() - recentMinutes * 60 * 1000;
       snapshotEvents = snapshotEvents.filter(e => new Date(e.ts).getTime() >= cutoff);
     }
-    const isPartial = recentMinutes > 0 || scope !== 'all';
+    const isPartial = recentMinutes > 0 || scope !== 'all' || ticketIds.length > 0;
     const eventLog = await computeEventLogHash(snapshotEvents, { allowLooseStart: isPartial });
     if (!eventLog.ok) {
       logSync('Snapshot aborted: invalid event chain', 'warning');
@@ -1346,7 +1375,8 @@ function App() {
         eventLogPartial: isPartial,
         eventLogHashAlgo: 'sha256',
         syncScope: scope,
-        syncRecentMinutes: recentMinutes
+        syncRecentMinutes: recentMinutes,
+        syncTicketIds: ticketIds
       }
     };
     const signer = {
@@ -1357,8 +1387,20 @@ function App() {
     const envelope = { type: 'snapshot', snapshot, signer };
     const sig = await signPayload(identity.privateKeyJwk, getSnapshotSignPayload(envelope));
     try {
-      conn.send({ ...envelope, sig });
-      logSync(`Snapshot sent to ${conn.peer}`);
+      const compression = settings.sync?.compression || 'none';
+      if (compression === 'gzip' && supportsCompression()) {
+        const compressed = await compressJson({ ...envelope, sig });
+        if (compressed.ok) {
+          conn.send({ type: 'snapshot_compressed', algo: 'gzip', data: compressed.data });
+          logSync(`Snapshot (compressed) sent to ${conn.peer}`);
+        } else {
+          conn.send({ ...envelope, sig });
+          logSync(`Snapshot sent to ${conn.peer}`);
+        }
+      } else {
+        conn.send({ ...envelope, sig });
+        logSync(`Snapshot sent to ${conn.peer}`);
+      }
       syncMeta();
     } catch (e) {
       logSync(`Snapshot failed to ${conn.peer}`, 'error');
@@ -1366,15 +1408,19 @@ function App() {
   }, [bumpSnapshotSeq, computeEventLogHash, getSnapshotSignPayload, identity, logSync, settings.sync, syncMeta]);
 
   const sendSnapshotToAll = useCallback(() => {
+    let conns = Array.from(connsRef.current.values()).filter(conn => conn.open);
+    const maxPeers = settings.sync?.maxPeers || 0;
+    if (settings.sync?.preferReputation) {
+      conns = conns.sort((a, b) => getRepScoreForPeer(b.peer) - getRepScoreForPeer(a.peer));
+    }
+    if (maxPeers > 0) conns = conns.slice(0, maxPeers);
     let sent = 0;
-    connsRef.current.forEach(conn => {
-      if (conn.open) {
-        void sendSnapshot(conn);
-        sent++;
-      }
+    conns.forEach(conn => {
+      void sendSnapshot(conn);
+      sent++;
     });
     if (!sent) logSync('No open connections to sync', 'warning');
-  }, [logSync, sendSnapshot]);
+  }, [getRepScoreForPeer, logSync, sendSnapshot, settings.sync]);
 
   const exportStateSnapshot = useCallback(async () => {
     if (!identity?.privateKeyJwk || !identity?.publicKeyJwk || !identity?.publicKeyFingerprint) return;
@@ -1521,8 +1567,22 @@ function App() {
     applySnapshot(data.snapshot);
   }, [adjustReputation, applySnapshot, computeEventLogHash, logAudit, logSync, shouldAllowInbound, verifySignedSnapshot, verifySnapshotSigner]);
 
+  const isValidTransition = useCallback((evt, existingTicket) => {
+    if (!evt?.type) return false;
+    if (evt.type === 'TicketCreated') return !existingTicket;
+    if (!existingTicket) return false;
+    const status = existingTicket.status;
+    if (evt.type === 'TicketAssigned') return ['Open', 'Waiting', 'Escalated'].includes(status);
+    if (evt.type === 'TicketEscalated') return ['Open', 'In Progress', 'Waiting'].includes(status);
+    if (evt.type === 'TicketResolved') return ['In Progress', 'Escalated', 'Waiting'].includes(status);
+    if (evt.type === 'TicketClosed') return ['Resolved'].includes(status);
+    if (evt.type === 'TicketReopened') return ['Closed'].includes(status);
+    return true;
+  }, []);
+
   const isAuthorizedEvent = useCallback((evt, incomingTicket, existingTicket) => {
     if (!evt) return false;
+    if (!isValidTransition(evt, existingTicket)) return false;
     const isSenior = getRoleRank(evt.actorRole) >= getRoleRank('Senior');
     if (evt.type === 'TicketEscalated') return isTrustedElevated(evt.actorFingerprint);
     if (evt.type === 'TicketClosed') {
@@ -1543,7 +1603,7 @@ function App() {
       return getRoleRank(evt.actorRole) >= getRoleRank('L1');
     }
     return true;
-  }, [isTrustedElevated]);
+  }, [isTrustedElevated, isValidTransition]);
 
   const applyEvent = useCallback((evt, ticket) => {
     if (!evt) return;
@@ -1717,6 +1777,19 @@ function App() {
         void (async () => {
           await handleIncomingSnapshot(data, conn.peer);
           logSync(`Snapshot synced with ${conn.peer}`);
+        })();
+        setGossipRound(prev => prev + 1);
+      }
+      if (data.type === 'snapshot_compressed') {
+        void (async () => {
+          const decompressed = await decompressJson(data.data);
+          if (!decompressed.ok) {
+            logSync(`Snapshot decompress failed from ${conn.peer}`, 'warning');
+            logAudit('Snapshot decompress failed', 'warning', conn.peer, { eventType: 'Snapshot' });
+            return;
+          }
+          await handleIncomingSnapshot(decompressed.data, conn.peer);
+          logSync(`Snapshot (compressed) synced with ${conn.peer}`);
         })();
         setGossipRound(prev => prev + 1);
       }
@@ -2091,6 +2164,7 @@ function App() {
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
+    if (!isValidTransition({ type: 'TicketAssigned' }, base)) return;
     const clock = bumpLamport();
     const seq = bumpEventSeq();
     const updatedTicket = {
@@ -2121,6 +2195,7 @@ function App() {
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
+    if (!isValidTransition({ type: 'TicketEscalated' }, base)) return;
     const currentLevelIdx = ROLES.indexOf(base.escalationLevel || 'L1');
     const nextLevel = ROLES[Math.min(currentLevelIdx + 1, ROLES.length - 1)];
     const clock = bumpLamport();
@@ -2153,6 +2228,7 @@ function App() {
     const now = new Date().toISOString();
     const base = stateRef.current.tickets.find(t => t.id === ticketId);
     if (!base) return;
+    if (!isValidTransition({ type: 'TicketResolved' }, base)) return;
     if (identity && base.agentId && base.agentId !== identity.peerId && !isTrustedElevated(identity.publicKeyFingerprint)) return;
     const clock = bumpLamport();
     const seq = bumpEventSeq();
@@ -2193,6 +2269,7 @@ function App() {
     } else {
       if (!isElevated) return;
     }
+    if (!isValidTransition({ type: 'TicketClosed' }, base)) return;
     const clock = bumpLamport();
     const seq = bumpEventSeq();
     const updatedTicket = {
@@ -2228,6 +2305,7 @@ function App() {
     const isOwner = identity.role === 'Customer' && base.customerPeerId === identity.peerId;
     const isElevated = isTrustedElevated(identity.publicKeyFingerprint);
     if (!isOwner && !isElevated) return;
+    if (!isValidTransition({ type: 'TicketReopened' }, base)) return;
     const clock = bumpLamport();
     const seq = bumpEventSeq();
     const updatedTicket = {
@@ -3052,7 +3130,7 @@ function TicketsView({ tickets, selectedTicketId, setSelectedTicketId, searchQue
 }
 
 // ============ TICKET DETAIL PANEL ============
-function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onCloseTicket, onReopenTicket, onSendMessage, identity, trustedElevated }) {
+function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onResolve, onCloseTicket, onReopenTicket, onSendMessage, identity, trustedElevated, fullWidth = false }) {
   const [msgInput, setMsgInput] = useState('');
   const msgsEndRef = useRef(null);
   const bg = isDark ? 'bg-slate-800/80 border-slate-700/50' : 'bg-white border-slate-200';
@@ -3068,7 +3146,7 @@ function TicketDetailPanel({ ticket, isDark, onClose, onClaim, onEscalate, onRes
     msgsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [ticket.messages.length]);
 
-  return h('div', { className: `w-full lg:w-[440px] xl:w-[500px] flex flex-col border-l animate-slide-in ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}` },
+  return h('div', { className: `${fullWidth ? 'flex-1 w-full' : 'w-full lg:w-[440px] xl:w-[500px]'} flex flex-col border-l animate-slide-in ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}` },
     // Header
     h('div', { className: `px-4 py-3 border-b flex items-center justify-between flex-shrink-0 ${isDark ? 'border-slate-800' : 'border-slate-200'}` },
       h('div', { className: 'flex items-center gap-2 min-w-0' },
@@ -3202,7 +3280,8 @@ function ChatView({ tickets, isDark, identity, onSendMessage, selectedTicketId, 
     selectedChat ?
       h(TicketDetailPanel, {
         ticket: selectedChat, isDark, onClose: () => setSelectedTicketId(null),
-        onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onCloseTicket: () => {}, onReopenTicket: () => {}, onSendMessage, identity, trustedElevated: []
+        onClaim: () => {}, onEscalate: () => {}, onResolve: () => {}, onCloseTicket: () => {}, onReopenTicket: () => {}, onSendMessage, identity, trustedElevated: [],
+        fullWidth: true
       }) :
       h('div', { className: 'flex-1 flex items-center justify-center' },
         h('div', { className: 'text-center' },
@@ -3817,7 +3896,7 @@ function AuditView({ auditLog, isDark, onTrustSigner, onRequestSnapshot, onMuteP
     });
   }, [auditLog, filterLevel, filterPeer, filterType]);
 
-  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-4 max-w-4xl' },
+  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-4 w-full max-w-none' },
     h('div', { className: 'flex items-center justify-between' },
       h('div', null,
         h('div', { className: 'text-lg font-semibold' }, 'Audit Log'),
@@ -3935,6 +4014,20 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
   const [recoveryStatus, setRecoveryStatus] = useState(null);
   const [rotationStatus, setRotationStatus] = useState(null);
   const bg = isDark ? 'bg-slate-800/50 border-slate-700/50' : 'bg-white border-slate-200';
+  const HelpTip = ({ text }) => h('span', {
+    className: 'ml-1 relative group inline-flex items-center'
+  },
+    h('span', {
+      className: `inline-flex items-center justify-center w-5 h-5 rounded-full border text-[11px] font-bold ${
+        isDark ? 'border-slate-700 text-slate-200 bg-slate-900/60' : 'border-slate-300 text-slate-800 bg-white'
+      }`
+    }, '?'),
+    h('span', {
+      className: `absolute left-full top-1/2 ml-2 -translate-y-1/2 hidden group-hover:block whitespace-nowrap px-3 py-2 text-xs font-medium rounded-lg shadow-2xl border z-[60] ${
+        isDark ? 'bg-slate-900 text-slate-100 border-slate-700' : 'bg-slate-900 text-slate-100 border-slate-800'
+      }`
+    }, text)
+  );
 
   const handleSave = () => {
     const updated = { ...identity, displayName: editName, role: editRole };
@@ -4123,7 +4216,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
     }));
   };
 
-  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6 max-w-2xl' },
+  return h('div', { className: 'flex-1 overflow-y-auto p-6 space-y-6 w-full max-w-none' },
     // Identity
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4 flex items-center gap-2' }, h(Icon, { name: 'key', size: 18 }), 'Cryptographic Identity'),
@@ -4133,14 +4226,14 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Peer ID: ', h('span', { className: 'font-mono text-brand-400' }, identity?.peerId)),
       h('div', { className: 'space-y-3' },
         h('div', null,
-          h('label', { className: 'text-sm text-slate-400 block mb-1' }, 'Display Name'),
+          h('label', { className: 'text-sm text-slate-400 block mb-1' }, 'Display Name', h(HelpTip, { text: 'Shown to other peers and used in events.' })),
           h('input', {
             type: 'text', value: editName, onChange: e => setEditName(e.target.value),
             className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
           })
         ),
         h('div', null,
-          h('label', { className: 'text-sm text-slate-400 block mb-1' }, 'Role'),
+          h('label', { className: 'text-sm text-slate-400 block mb-1' }, 'Role', h(HelpTip, { text: 'Controls permissions for actions like claim/escalate/resolve.' })),
           h('select', {
             value: editRole, onChange: e => setEditRole(e.target.value),
             className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
@@ -4176,11 +4269,11 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Recovery Phrase & Rotation'),
       h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
-        'Generate a recovery phrase to encrypt your identity bundle. This lets you recover without exposing your private key.'
+        'Generate a recovery phrase to encrypt your identity bundle. Store it offline. If you lose it, recovery is not possible.'
       ),
       h('div', { className: 'space-y-3' },
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recovery Phrase'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recovery Phrase', h(HelpTip, { text: 'Keep this offline. It encrypts your identity bundle for recovery.' })),
           h('input', {
             type: 'text',
             value: recoveryPhrase,
@@ -4194,7 +4287,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           )
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Confirm Phrase (optional)'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Confirm Phrase (optional)', h(HelpTip, { text: 'Optional check to avoid typos before exporting.' })),
           h('input', {
             type: 'text',
             value: recoveryConfirm,
@@ -4204,7 +4297,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Import Encrypted Recovery Bundle'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Import Encrypted Recovery Bundle', h(HelpTip, { text: 'Paste the exported recovery JSON and use your phrase to decrypt.' })),
           h('textarea', {
             rows: 4,
             value: recoveryBundleText,
@@ -4218,7 +4311,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       recoveryStatus && h('div', { className: `mt-3 text-xs ${recoveryStatus.type === 'error' ? 'text-red-400' : recoveryStatus.type === 'success' ? 'text-emerald-400' : 'text-slate-400'}` }, recoveryStatus.msg),
       h('div', { className: 'mt-4 flex items-center justify-between' },
         h('div', null,
-          h('div', { className: 'text-sm' }, 'Key Rotation'),
+          h('div', { className: 'text-sm' }, 'Key Rotation', h(HelpTip, { text: 'Generates a new keypair and stores a signed rotation proof.' })),
           h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Generate a new keypair and create a rotation proof.')
         ),
         h('button', { onClick: handleRotateKeys, className: 'px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs rounded-lg font-medium transition-colors' }, 'Rotate Keys')
@@ -4228,8 +4321,8 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
 
     // State export/import
     h('div', { className: `rounded-xl border ${bg} p-6` },
-      h('h3', { className: 'text-lg font-semibold mb-4' }, 'State Export & Import'),
-      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Export a signed snapshot of the current state or import one with validation.'),
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'State Export & Import', h(HelpTip, { text: 'Use for full backups or migrating between devices.' })),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Export a signed snapshot of the current state or import one with validation. Use this for full backups and migrations.'),
       h('div', { className: 'flex flex-wrap gap-2 mb-4' },
         h('button', { onClick: onExportState, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Export State Snapshot'),
         h('button', { onClick: () => setStateImportText(''), className: `px-4 py-2 text-sm rounded-lg font-medium border ${isDark ? 'border-slate-700 text-slate-300 hover:text-white' : 'border-slate-200 text-slate-600 hover:text-slate-900'}` }, 'Clear Import')
@@ -4251,7 +4344,14 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
     // Trust & roles
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Trust & Role Enforcement'),
-      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Only fingerprints in this list can perform elevated actions (escalations, supervisor overrides).'),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
+        'Only fingerprints in this list can perform elevated actions (escalations, supervisor overrides).',
+        h(HelpTip, { text: 'Local-only trust. Each peer decides who can perform elevated actions.' })
+      ),
+      h('div', { className: `text-xs mb-2 ${isDark ? 'text-slate-500' : 'text-slate-400'}` },
+        'Add trusted fingerprint',
+        h(HelpTip, { text: 'Paste a peer fingerprint from the Known Peers list to grant elevated actions.' })
+      ),
       h('div', { className: 'flex gap-2 mb-3' },
         h('input', {
           type: 'text',
@@ -4293,7 +4393,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Governance Controls'),
       h('div', { className: 'space-y-4' },
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Vote Threshold (weight)'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Vote Threshold (weight)', h(HelpTip, { text: 'Total vote weight required before auto-quarantine.' })),
           h('input', {
             type: 'number',
             min: 1,
@@ -4302,10 +4402,10 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
             onChange: e => updateVoteThreshold(e.target.value),
             className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
           }),
-          h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Higher values require more (or higher reputation) votes to quarantine.')
+          h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Higher values require more (or higher reputation) votes to quarantine. Local-only; not shared across peers.')
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Quarantined Peers'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Quarantined Peers', h(HelpTip, { text: 'Quarantined peers are blocked from inbound traffic.' })),
           (settings.security?.quarantinedPeers || []).length === 0 ?
             h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'No quarantined peers.') :
             h('div', { className: 'space-y-2' },
@@ -4325,8 +4425,8 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Sybil Resistance (Proof of Work)'),
       h('div', { className: 'flex items-center justify-between mb-3' },
         h('div', null,
-          h('div', { className: 'text-sm' }, 'Require PoW for new peers'),
-          h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Unknown peers must present a PoW token on hello.')
+        h('div', { className: 'text-sm' }, 'Require PoW for new peers', h(HelpTip, { text: 'Requires proof-of-work from unknown peers before accepting them.' })),
+          h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Unknown peers must present a PoW token on hello. Higher difficulty means slower joins.')
         ),
         h('button', {
           onClick: () => setSettings(s => ({
@@ -4342,7 +4442,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
         )
       ),
       h('div', null,
-        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Difficulty (leading zeros)'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Difficulty (leading zeros)', h(HelpTip, { text: 'Higher values increase the cost of joining for new peers.' })),
         h('input', {
           type: 'number',
           min: 1,
@@ -4363,8 +4463,8 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
 
     // Policy sync
     h('div', { className: `rounded-xl border ${bg} p-6` },
-      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Policy Synchronization'),
-      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Share your local policy set or accept proposals from peers.'),
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Policy Synchronization', h(HelpTip, { text: 'Signed proposals you can accept or reject locally.' })),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Share your local policy set or accept proposals from peers. Accepting applies their security/SLA/sync policy locally.'),
       h('div', { className: 'flex flex-wrap gap-2 mb-4' },
         h('button', { onClick: onSendPolicy, className: 'px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm rounded-lg font-medium transition-colors' }, 'Share Policy')
       ),
@@ -4390,10 +4490,10 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
 
     // Sync preferences
     h('div', { className: `rounded-xl border ${bg} p-6` },
-      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Sync Preferences'),
-      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limit snapshots to recent events to reduce bandwidth.'),
+      h('h3', { className: 'text-lg font-semibold mb-4' }, 'Sync Preferences', h(HelpTip, { text: 'Controls what your snapshots include and who you send to.' })),
+      h('div', { className: `text-xs mb-4 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limit snapshots to reduce bandwidth. These settings only affect what you send.'),
       h('div', null,
-        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Scope'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Scope', h(HelpTip, { text: 'Limits snapshot content to all tickets or just those you own/are assigned.' })),
         h('select', {
           value: settings.sync?.scope || 'all',
           onChange: e => setSettings(s => ({ ...s, sync: { ...s.sync, scope: e.target.value } })),
@@ -4406,7 +4506,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
         h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limits which tickets/events are included in snapshots.')
       ),
       h('div', { className: 'mt-3' },
-        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recent Events Window (minutes)'),
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Recent Events Window (minutes)', h(HelpTip, { text: 'Only include events newer than this window.' })),
         h('input', {
           type: 'number',
           min: 0,
@@ -4415,6 +4515,59 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
         }),
         h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Set to 0 for full bounded history.')
+      ),
+      h('div', { className: 'mt-3' },
+        h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Ticket IDs (comma-separated)', h(HelpTip, { text: 'Restrict snapshots to specific ticket IDs.' })),
+        h('input', {
+          type: 'text',
+          value: (settings.sync?.ticketIds || []).join(', '),
+          onChange: e => {
+            const ids = (e.target.value || '').split(',').map(s => s.trim()).filter(Boolean);
+            setSettings(s => ({ ...s, sync: { ...s.sync, ticketIds: ids } }));
+          },
+          placeholder: '#abc123, #def456',
+          className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+        }),
+        h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Limit snapshot sync to specific tickets.')
+      ),
+      h('div', { className: 'mt-3 grid grid-cols-1 md:grid-cols-2 gap-3' },
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Compression', h(HelpTip, { text: 'Gzip reduces bandwidth if supported by your browser.' })),
+          h('select', {
+            value: settings.sync?.compression || 'none',
+            onChange: e => setSettings(s => ({ ...s, sync: { ...s.sync, compression: e.target.value } })),
+            className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          },
+            h('option', { value: 'none' }, 'None'),
+            h('option', { value: 'gzip' }, 'Gzip (if supported)')
+          )
+        ),
+        h('div', null,
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Max Peers per Sync', h(HelpTip, { text: 'Limit how many peers receive each snapshot.' })),
+          h('input', {
+            type: 'number',
+            min: 0,
+            value: settings.sync?.maxPeers || 0,
+            onChange: e => setSettings(s => ({ ...s, sync: { ...s.sync, maxPeers: Math.max(0, Number(e.target.value) || 0) } })),
+            className: `w-full px-3 py-2 text-sm rounded-lg border ${isDark ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'} focus:outline-none focus:border-brand-500`
+          }),
+          h('div', { className: `text-[11px] mt-1 ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, '0 = all peers.')
+        )
+      ),
+      h('div', { className: 'mt-3 flex items-center justify-between' },
+        h('div', null,
+          h('div', { className: 'text-sm' }, 'Prefer High-Reputation Peers', h(HelpTip, { text: 'Prioritize higher reputation peers when selecting sync targets.' })),
+          h('div', { className: `text-[11px] ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Prioritize peers with better reputation for sync.')
+        ),
+        h('button', {
+          onClick: () => setSettings(s => ({ ...s, sync: { ...s.sync, preferReputation: !s.sync?.preferReputation } })),
+          className: `w-12 h-6 rounded-full transition-colors relative ${settings.sync?.preferReputation ? 'bg-brand-500' : isDark ? 'bg-slate-700' : 'bg-slate-300'}`
+        },
+          h('div', {
+            className: 'w-5 h-5 rounded-full bg-white absolute top-0.5 transition-all shadow',
+            style: { left: settings.sync?.preferReputation ? 26 : 2 }
+          })
+        )
       )
     ),
 
@@ -4422,7 +4575,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
     h('div', { className: `rounded-xl border ${bg} p-6` },
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Appearance'),
       h('div', { className: 'flex items-center justify-between' },
-        h('span', { className: 'text-sm' }, 'Dark Mode'),
+        h('span', { className: 'text-sm' }, 'Dark Mode', h(HelpTip, { text: 'Toggles light/dark theme locally.' })),
         h('button', {
           onClick: () => setSettings(s => ({ ...s, theme: s.theme === 'dark' ? 'light' : 'dark' })),
           className: `w-12 h-6 rounded-full transition-colors relative ${isDark ? 'bg-brand-500' : 'bg-slate-300'}`
@@ -4440,7 +4593,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'Simulation'),
       h('div', { className: 'flex items-center justify-between' },
         h('div', null,
-          h('div', { className: 'text-sm' }, 'Demo Mode'),
+          h('div', { className: 'text-sm' }, 'Demo Mode', h(HelpTip, { text: 'Simulates activity and network events for demos.' })),
           h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Generates simulated activity and network events.')
         ),
         h('button', {
@@ -4460,7 +4613,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'PeerJS Signaling'),
       h('div', { className: 'flex items-center justify-between mb-4' },
         h('div', null,
-          h('div', { className: 'text-sm' }, 'Use Custom PeerJS Server'),
+        h('div', { className: 'text-sm' }, 'Use Custom PeerJS Server', h(HelpTip, { text: 'Toggle to use your own PeerJS signaling server.' })),
           h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Defaults to the public PeerJS cloud.')
         ),
         h('button', {
@@ -4478,7 +4631,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       ),
       h('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-3' },
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Host'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Host', h(HelpTip, { text: 'PeerJS host name or IP.' })),
           h('input', {
             type: 'text',
             value: settings.peerServer?.host || '',
@@ -4487,7 +4640,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Port'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Port', h(HelpTip, { text: 'PeerJS server port.' })),
           h('input', {
             type: 'number',
             value: settings.peerServer?.port ?? 9000,
@@ -4496,7 +4649,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Path'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Path', h(HelpTip, { text: 'PeerJS server path, e.g. /peerjs.' })),
           h('input', {
             type: 'text',
             value: settings.peerServer?.path || '/peerjs',
@@ -4517,7 +4670,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
               style: { left: settings.peerServer?.secure ? 26 : 2 }
             })
           ),
-          h('span', { className: 'text-sm' }, 'Secure (wss)')
+          h('span', { className: 'text-sm' }, 'Secure (wss)', h(HelpTip, { text: 'Enable TLS for secure websocket connections.' }))
         )
       )
     ),
@@ -4527,7 +4680,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       h('h3', { className: 'text-lg font-semibold mb-4' }, 'TURN Relay'),
       h('div', { className: 'flex items-center justify-between mb-4' },
         h('div', null,
-          h('div', { className: 'text-sm' }, 'Enable TURN'),
+        h('div', { className: 'text-sm' }, 'Enable TURN', h(HelpTip, { text: 'Use a relay when direct peer connections fail.' })),
           h('div', { className: `text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}` }, 'Relays traffic when direct P2P fails.')
         ),
         h('button', {
@@ -4545,7 +4698,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
       ),
       h('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-3' },
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'TURN Host'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'TURN Host', h(HelpTip, { text: 'TURN server hostname or IP.' })),
           h('input', {
             type: 'text',
             value: settings.turn?.host || '',
@@ -4554,7 +4707,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'TURN Port'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'TURN Port', h(HelpTip, { text: 'TURN server port (usually 3478).' })),
           h('input', {
             type: 'number',
             value: settings.turn?.port ?? 3478,
@@ -4563,7 +4716,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Username'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Username', h(HelpTip, { text: 'TURN username from your server config.' })),
           h('input', {
             type: 'text',
             value: settings.turn?.username || '',
@@ -4572,7 +4725,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
           })
         ),
         h('div', null,
-          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Credential'),
+          h('label', { className: `text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'} block mb-1` }, 'Credential', h(HelpTip, { text: 'TURN credential/password.' })),
           h('input', {
             type: 'password',
             value: settings.turn?.credential || '',
@@ -4593,7 +4746,7 @@ function SettingsView({ identity, setIdentity, setPeerId, settings, setSettings,
               style: { left: settings.turn?.useTLS ? 26 : 2 }
             })
           ),
-          h('span', { className: 'text-sm' }, 'Use TLS (turns)')
+          h('span', { className: 'text-sm' }, 'Use TLS (turns)', h(HelpTip, { text: 'Enable TLS for TURN if configured on the server.' }))
         )
       )
     ),

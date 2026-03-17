@@ -13,12 +13,12 @@ Security and consistency hardening now implemented:
 - Role enforcement with local trusted-elevated allowlist for sensitive actions.
 - Offline outbox for guaranteed delivery after reconnect.
 - SLA timers and escalation rules (auto-escalate, supervisor alerts) with signed events.
-- Ticket-level access control (ACL) scaffolding for restricted visibility.
+- Ticket-level access control (ACL) scaffolding for restricted visibility (no encryption yet).
 - Recovery phrase + encrypted identity bundle + key rotation with rotation proof.
 - Governance controls: vote-to-mute, quarantine, reputation-weighted votes, local reputation scoring.
 - Policy synchronization with signed proposals and local acceptance.
 - Full state export/import with signed snapshot validation.
-- Selective sync by scope (all/assigned/own) and recency window.
+- Selective sync by scope (all/assigned/own), recency window, per-ticket selection, and optional compression.
 - Peer discovery via signed peer list gossip and request/response.
 - Sybil resistance via optional proof-of-work for new peers.
 
@@ -78,7 +78,7 @@ Next: Shared moderation signals, content filters, and appeal flow.
 
 9. Reputation / Reciprocity Layer (Baseline)
 Gap: No incentive to relay, stay online, or contribute to sync health.
-Implemented: Local reputation scoring used for vote weighting; audit-backed adjustments.
+Implemented: Local reputation scoring used for vote weighting and peer preference for sync; audit-backed adjustments.
 Game-theory issue: Free-rider equilibrium.
 Next: Use reputation to prefer peers for sync and relay.
 
@@ -96,9 +96,9 @@ Next: Invite-signed onboarding or adaptive PoW by reputation.
 
 12. Larger Scalability Controls (Selective Sync)
 Gap: All events broadcast to all peers; bounded history only.
-Implemented: Selective snapshot sync by scope (all/assigned/own) + recency window.
+Implemented: Selective snapshot sync by scope (all/assigned/own) + recency window + per-ticket selection, with optional gzip compression.
 Game-theory issue: Rational peers may drop due to cost.
-Next: Compression and per-ticket selective sync.
+Next: Per-ticket delta sync and event-level compression (optional).
 
 13. Policy Synchronization
 Gap: Trust list and rate limits are local; no consistency expectations.
@@ -110,13 +110,14 @@ Gap: No export/import of full state.
 Implemented: Export signed snapshots, import with validation.
 Game-theory issue: Lock-in and data loss increase defection risk.
 
-**Next (Planned)**
-1. Explicit Arbitration for Disputes
+15. Explicit Arbitration for Disputes (Baseline)
 Gap: Conflict resolution is deterministic but does not capture business rules for disputes.
+Implemented: State machine validation for ticket transitions (assign/escalate/resolve/close/reopen) with role-based constraints.
 Game-theory issue: Parties may race valid updates to win.
-Feature: State machine rules for ticket transitions with role-based constraints.
+Next: Expand arbitration rules to cover business-specific workflows and dispute states.
 
-2. Ticket Data Encryption
+**Next (Planned)**
+1. Ticket Data Encryption
 Gap: ACL is visibility-only; data not encrypted.
 Game-theory issue: Unauthorized peers could still access if they obtain state.
 Feature: Per-ticket encryption with role/peer key distribution.
@@ -124,4 +125,3 @@ Feature: Per-ticket encryption with role/peer key distribution.
 **Quick Priority (Highest Game-Theory Impact)**
 - Ticket data encryption (beyond ACL visibility).
 - Arbitration rules for disputes.
-- Compression and per-ticket selective sync.

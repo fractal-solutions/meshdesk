@@ -16,7 +16,8 @@ This build includes security and consistency hardening:
 - Optional sybil resistance via proof-of-work on new peer hellos.
 - Policy synchronization with signed proposals and local acceptance.
 - Full state export/import with signed snapshot validation.
-- Selective sync by scope (all/assigned/own) and recency window.
+- Selective sync by scope (all/assigned/own), recency window, ticket IDs, optional compression, and reputation-based peer preference.
+- Governance controls: vote-to-mute, quarantine, reputation-weighted votes.
 
 ## Quick Start (Local)
 
@@ -89,6 +90,8 @@ Result:
 - Selective sync is supported:
   - Scope: `all`, `assigned`, `own`
   - Recency window (minutes)
+  - Ticket ID allowlist
+  - Optional gzip compression (if supported)
 
 If you want to force a resync:
 1. Open **Network** view.
@@ -130,10 +133,6 @@ Configure in **Settings -> Governance Controls**:
 - **Vote Threshold (weight)**: how much vote weight is required to quarantine.
 - **Quarantined Peers**: list of currently quarantined peers with release controls.
 
-## Policy Synchronization
-
-Peers can share signed policy proposals (security, SLA, sync). Proposals appear in **Settings -> Policy Synchronization** with Accept/Reject controls. Policy acceptance is local and explicit.
-
 ## Offline Outbox (Guaranteed Delivery)
 
 When you are offline or have no open connections, outbound events are queued locally.
@@ -169,6 +168,45 @@ In **Settings -> Recovery Phrase & Rotation** you can:
 - Export an encrypted identity bundle
 - Import a recovery bundle with the phrase
 - Rotate your keypair (creates a signed rotation proof)
+
+## Sync Preferences
+
+In **Settings -> Sync Preferences** you can limit what you send:
+- **Scope**: all / assigned to me / assigned or owned by me
+- **Recent Events Window**: only send recent events
+- **Ticket IDs**: only include specific tickets
+- **Compression**: gzip snapshots when supported
+- **Max Peers per Sync**: limit sync fanout
+- **Prefer High-Reputation Peers**: prioritize peers with better reputation
+
+## Policy Synchronization
+
+In **Settings -> Policy Synchronization**:
+- **Share Policy** sends your local security/SLA/sync settings to peers.
+- **Accept/Reject** applies or ignores peer proposals locally.
+
+## State Export & Import
+
+In **Settings -> State Export & Import**:
+- Export a signed full snapshot for backup/migration.
+- Import a snapshot with signature and event-log validation.
+
+## Peer Discovery
+
+Peers can exchange a signed peer list (gossip):
+- Request and share peer rosters in the Network view.
+- Received lists are verified before adding to known peers.
+
+## Sybil Resistance (PoW)
+
+When enabled, unknown peers must present a proof-of-work token on hello.
+Higher difficulty slows joins and makes identity spam more costly.
+
+## Arbitration Rules (Baseline)
+
+Ticket transitions are validated by a basic state machine:
+- Assign / Escalate / Resolve / Close / Reopen are checked against current status
+- Invalid transitions are rejected (locally and on inbound events)
 
 ## Running Your Own PeerJS Server (Signaling)
 
@@ -282,20 +320,3 @@ If the Network log shows "Connected" but no "Snapshot synced":
 
 - The app stores data in `localStorage` per browser.
 - WebRTC requires a signaling server (PeerJS). TURN is required for reliability across NAT/firewalls.
-## State Export / Import
-
-In **Settings -> State Export & Import** you can:
-- Export a signed snapshot of current state.
-- Import a snapshot with signature + event log hash validation.
-
-## Peer Discovery
-
-Peers can share signed peer lists (gossip) to help discovery.
-- **Network -> Share Peer List** broadcasts your roster.
-- **Peer List** button requests a roster from a specific peer.
-
-## Sybil Resistance (PoW)
-
-Optional proof-of-work can be required for new peers:
-- **Settings -> Sybil Resistance (Proof of Work)**
-- Unknown peers must include a valid PoW token with hello.

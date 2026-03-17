@@ -49,6 +49,13 @@
       - `autoEscalateAfterMins`
       - `autoEscalateCritical`
       - `supervisorAlertAfterMins`
+    - `sync`:
+      - `scope` (`all` | `assigned` | `own`)
+      - `recentMinutes`
+      - `ticketIds` (array)
+      - `compression` (`none` | `gzip`)
+      - `maxPeers` (0 = all)
+      - `preferReputation` (boolean)
 
 - `meshdesk_outbox`
   - Offline outbound queue for events while disconnected.
